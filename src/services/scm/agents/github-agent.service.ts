@@ -9,7 +9,7 @@ export class GithubAgent {
   private readonly scmChangeBuilderService = Container.get(ScmChangeBuilderService);
 
   private readonly octokit = new Octokit({
-    auth: process.env.GITHUB_SECRET,
+    auth: process.env.GITHUB_TOKEN,
     baseUrl: process.env.GITHUB_API_URL,
   });
 

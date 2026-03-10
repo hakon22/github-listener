@@ -39,7 +39,8 @@
   - `GITLAB_TOKEN` — токен доступа для GitLab API.
 - **GitHub**
   - `GITHUB_API_URL` — URL GitHub API.
-  - `GITHUB_SECRET` — secret доступа для GitHub API.
+  - `GITHUB_TOKEN` — доступ для GitHub API.
+  - `GITHUB_SECRET` — secret GitHub API.
 - **AI‑модели (через LangChain)**
   - `MISTRAL_API_KEY` - API ключ модели Mistral.
 - **Docker**
@@ -66,7 +67,7 @@
 npm ci
 ```
 
-2. Настроить `.env` (минимум: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GITLAB_TOKEN` и/или `GITHUB_SECRET`).
+2. Настроить `.env` (минимум: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GITLAB_TOKEN` и/или `GITHUB_TOKEN`, `GITHUB_SECRET`).
 
 3. Запустить в режиме разработки:
 

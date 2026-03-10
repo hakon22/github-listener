@@ -29,7 +29,7 @@ export class GithubWebhookController extends BaseService {
       const eventName = req.headers['x-github-event'] as string | undefined;
       const signature = req.headers['x-hub-signature-256'] as string;
 
-      const verified = await this.webhooks.verify(req.body.toString(), signature);
+      const verified = await this.webhooks.verify(JSON.stringify(req.body), signature);
       if (!verified) {
         return res.status(401).json({ status: 'unauthorized' });
       }

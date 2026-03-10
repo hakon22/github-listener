@@ -1,7 +1,7 @@
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
 import { ModelBaseService } from '@/services/core/model-base.service';
 
-import { Inject, Singleton } from 'typescript-ioc';
+import { Container, Singleton } from 'typescript-ioc';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { StringOutputParser } from '@langchain/core/output_parsers';
 import { RunnableSequence } from '@langchain/core/runnables';
@@ -50,8 +50,7 @@ export class AIService extends ModelBaseService {
   /** Минимальный интервал между запросами к модели (не более 1 запроса в секунду). */
   private static readonly MIN_REQUEST_INTERVAL_MS = 1000;
 
-  @Inject
-  private readonly vectorStoreService!: VectorStoreService;
+  private readonly vectorStoreService = Container.get(VectorStoreService);
 
   public constructor() {
     super();

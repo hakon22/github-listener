@@ -1,3 +1,4 @@
+import { Container, Singleton } from 'typescript-ioc';
 import { SecurityAnalyzerService } from '@/services/analysis/security-analyzer.service';
 import { PerformanceAnalyzerService } from '@/services/analysis/performance-analyzer.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
@@ -5,7 +6,6 @@ import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import { ESLint } from 'eslint';
 import ts from 'typescript';
 import * as path from 'path';
-import { Inject } from 'typescript-ioc';
 
 export interface CodeIssueInterface {
   file: string;
@@ -80,14 +80,13 @@ type FunctionSignatureMetaInterface = {
   parameters: FunctionParameterMetaInterface[];
 };
 
+@Singleton
 export class CodeAnalyzerService {
-  private eslint: ESLint;
+  private readonly eslint: ESLint;
 
-  @Inject
-  private readonly securityAnalyzer: SecurityAnalyzerService;
+  private readonly securityAnalyzer = Container.get(SecurityAnalyzerService);
 
-  @Inject
-  private readonly performanceAnalyzer: PerformanceAnalyzerService;
+  private readonly performanceAnalyzer = Container.get(PerformanceAnalyzerService);
 
   public constructor() {
     this.eslint = new ESLint({

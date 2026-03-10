@@ -1,3 +1,4 @@
+import { Singleton } from 'typescript-ioc';
 import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
 
 interface SecurityRule {
@@ -6,6 +7,7 @@ interface SecurityRule {
   severity: CodeIssueInterface['severity'];
 }
 
+@Singleton
 export class SecurityAnalyzerService {
   private readonly dangerousPatterns: SecurityRule[] = [
     {

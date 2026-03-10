@@ -1,3 +1,4 @@
+import { Singleton } from 'typescript-ioc';
 import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
 
 interface PerformanceRule {
@@ -7,6 +8,7 @@ interface PerformanceRule {
   suggestion?: string;
 }
 
+@Singleton
 export class PerformanceAnalyzerService {
   private readonly patterns: PerformanceRule[] = [
     {
