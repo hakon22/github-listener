@@ -1,6 +1,6 @@
 services:
   github-listener:
-    image: github-listener:latest
+    image: ${DOCKER_USERNAME}/github-listener:latest
     network_mode: "host"
     env_file: .env
     ports:
