@@ -15,7 +15,7 @@ RUN npm run build
 FROM node:25-alpine AS app
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/dist/src ./src
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/tsconfig.json ./
 EXPOSE 3013
