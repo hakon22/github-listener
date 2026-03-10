@@ -1,0 +1,14 @@
+services:
+  github-listener-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: github-listener-dev:latest
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "3013:3013"
+    volumes:
+      - "C:/srv/logs:/srv/logs"
+    command: start:app:docker:dev

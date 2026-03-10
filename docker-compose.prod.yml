@@ -1,0 +1,13 @@
+services:
+  github-listener:
+    image: github-listener:latest
+    network_mode: "host"
+    env_file: .env
+    ports:
+      - "3013:3013"
+    volumes:
+      - /srv/logs:/srv/logs
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    restart: unless-stopped
+    command: start:app:docker:prod
