@@ -4,6 +4,7 @@ import type { Request, Response } from 'express';
 import type { PushEvent, PullRequestEvent } from '@octokit/webhooks-types';
 
 import { BaseService } from '@/services/core/base.service';
+import { AffectedFilesService } from '@/services/analysis/affected-files.service';
 import { GithubAgent } from '@/services/scm/agents/github-agent.service';
 import { ScmReviewService } from '@/services/scm/scm-review.service';
 import { ScmNotificationService } from '@/services/scm/scm-notification.service';
@@ -14,6 +15,8 @@ type GithubPullRequestEvent = PullRequestEvent;
 
 @Singleton
 export class GithubWebhookController extends BaseService {
+  private readonly affectedFilesService = Container.get(AffectedFilesService);
+
   private readonly githubAgent = Container.get(GithubAgent);
 
   private readonly scmReviewService = Container.get(ScmReviewService);
@@ -70,6 +73,7 @@ export class GithubWebhookController extends BaseService {
     try {
       if (filesCount > 0) {
         const changedPaths = Array.from(changedFiles);
+        const ref = event.after ?? branch;
 
         const changes = event.before && event.after
           ? await this.githubAgent.getPushChanges(
@@ -86,8 +90,48 @@ export class GithubWebhookController extends BaseService {
             changedPaths,
           );
 
+        let mergedChanges = changes;
+
+        if (process.env.IMPACT_ANALYSIS_ENABLED !== 'false') {
+          try {
+            const affectedPaths = await this.affectedFilesService.getAffectedPaths(
+              changedPaths,
+              {
+                getSourceFilePaths: () => this.githubAgent.getRepositorySourceFilePaths(
+                  repositoryOwner,
+                  event.repository.name,
+                  ref,
+                  { maxFiles: 200 },
+                ),
+                getFileContent: (filePath) => this.githubAgent.getFileContentAtRef(
+                  repositoryOwner,
+                  event.repository.name,
+                  filePath,
+                  ref,
+                ),
+              },
+              { affectedFileLimit: 50 },
+            );
+
+            const changedSet = new Set(changedPaths);
+            const pathsToFetch = affectedPaths.filter((filePath) => !changedSet.has(filePath));
+
+            if (pathsToFetch.length > 0) {
+              const affectedChanges = await this.githubAgent.getFilesSnapshot(
+                repositoryOwner,
+                event.repository.name,
+                ref,
+                pathsToFetch,
+              );
+              mergedChanges = [...changes, ...affectedChanges];
+            }
+          } catch {
+            // fallback: analyze only changed files
+          }
+        }
+
         const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
-          changes,
+          mergedChanges,
           commits.map((commit: GithubPushEvent['commits'][number]) => ({
             id: commit.id,
             message: commit.message,
@@ -166,8 +210,50 @@ export class GithubWebhookController extends BaseService {
         pullRequestNumber,
       );
 
+      let mergedChanges = changes;
+      const ref = event.pull_request.head.sha;
+
+      if (process.env.IMPACT_ANALYSIS_ENABLED !== 'false' && changes.length > 0) {
+        try {
+          const changedPaths = changes.map((change) => change.file);
+          const affectedPaths = await this.affectedFilesService.getAffectedPaths(
+            changedPaths,
+            {
+              getSourceFilePaths: () => this.githubAgent.getRepositorySourceFilePaths(
+                repositoryOwner,
+                event.repository.name,
+                ref,
+                { maxFiles: 200 },
+              ),
+              getFileContent: (filePath) => this.githubAgent.getFileContentAtRef(
+                repositoryOwner,
+                event.repository.name,
+                filePath,
+                ref,
+              ),
+            },
+            { affectedFileLimit: 50 },
+          );
+
+          const changedSet = new Set(changedPaths);
+          const pathsToFetch = affectedPaths.filter((filePath) => !changedSet.has(filePath));
+
+          if (pathsToFetch.length > 0) {
+            const affectedChanges = await this.githubAgent.getFilesSnapshot(
+              repositoryOwner,
+              event.repository.name,
+              ref,
+              pathsToFetch,
+            );
+            mergedChanges = [...changes, ...affectedChanges];
+          }
+        } catch {
+          // fallback: analyze only changed files
+        }
+      }
+
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
-        changes,
+        mergedChanges,
         [],
         '<b>Результаты анализа кода по Pull Request</b>',
       );

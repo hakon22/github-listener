@@ -2,7 +2,7 @@ import { ModelBaseService } from '@/services/core/model-base.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 import { Singleton } from 'typescript-ioc';
-import type { MistralAIEmbeddings } from '@langchain/mistralai';
+import type { OpenAIEmbeddings } from '@langchain/openai';
 
 interface CodeVectorEntry {
   file: string;
@@ -12,7 +12,7 @@ interface CodeVectorEntry {
 
 @Singleton
 export class VectorStoreService extends ModelBaseService {
-  private embeddings: MistralAIEmbeddings | null = null;
+  private embeddings: OpenAIEmbeddings | null = null;
 
   private vectors: CodeVectorEntry[] = [];
 
@@ -41,7 +41,7 @@ export class VectorStoreService extends ModelBaseService {
     return result;
   };
 
-  private getEmbeddings = async (): Promise<MistralAIEmbeddings> => {
+  private getEmbeddings = async (): Promise<OpenAIEmbeddings> => {
     if (this.embeddings) {
       return this.embeddings;
     }

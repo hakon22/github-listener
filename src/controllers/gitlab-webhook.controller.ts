@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import { Container, Singleton } from 'typescript-ioc';
 
 import { BaseService } from '@/services/core/base.service';
+import { AffectedFilesService } from '@/services/analysis/affected-files.service';
 import { GitlabAgentService } from '@/services/scm/agents/gitlab-agent.service';
 import { ScmReviewService } from '@/services/scm/scm-review.service';
 import { ScmNotificationService } from '@/services/scm/scm-notification.service';
@@ -47,6 +48,8 @@ interface GitlabPushEvent {
 
 @Singleton
 export class GitlabWebhookController extends BaseService {
+  private readonly affectedFilesService = Container.get(AffectedFilesService);
+
   private readonly gitlabAgentService = Container.get(GitlabAgentService);
 
   private readonly scmReviewService = Container.get(ScmReviewService);
@@ -99,6 +102,7 @@ export class GitlabWebhookController extends BaseService {
     try {
       if (filesCount > 0) {
         const changedPaths = Array.from(changedFiles);
+        const ref = event.after ?? branch;
 
         const changes = event.before && event.after
           ? await this.gitlabAgentService.getPushChanges(
@@ -113,8 +117,45 @@ export class GitlabWebhookController extends BaseService {
             changedPaths,
           );
 
+        let mergedChanges = changes;
+
+        if (process.env.IMPACT_ANALYSIS_ENABLED !== 'false') {
+          try {
+            const affectedPaths = await this.affectedFilesService.getAffectedPaths(
+              changedPaths,
+              {
+                getSourceFilePaths: () => this.gitlabAgentService.getRepositorySourceFilePaths(
+                  projectId,
+                  ref,
+                  { maxFiles: 200 },
+                ),
+                getFileContent: (filePath) => this.gitlabAgentService.getFileContentAtRef(
+                  projectId,
+                  filePath,
+                  ref,
+                ),
+              },
+              { affectedFileLimit: 50 },
+            );
+
+            const changedSet = new Set(changedPaths);
+            const pathsToFetch = affectedPaths.filter((filePath) => !changedSet.has(filePath));
+
+            if (pathsToFetch.length > 0) {
+              const affectedChanges = await this.gitlabAgentService.getFilesSnapshot(
+                projectId,
+                ref,
+                pathsToFetch,
+              );
+              mergedChanges = [...changes, ...affectedChanges];
+            }
+          } catch {
+            // fallback: analyze only changed files
+          }
+        }
+
         const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
-          changes,
+          mergedChanges,
           commits.map((commit) => ({
             id: commit.id,
             message: commit.message,

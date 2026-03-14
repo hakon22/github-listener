@@ -78,11 +78,57 @@ export class GitlabAgentService {
   public getFilesSnapshot = async (projectId: number, ref: string, paths: string[]): Promise<ScmChangeInterface[]> => {
     const changes = await this.scmChangeBuilderService.buildSnapshotChanges(
       paths,
-      (filePath) => this.getFileContent(projectId, filePath, ref),
+      (filePath) => this.getFileContentAtRef(projectId, filePath, ref),
     );
 
     return changes;
   };
+
+  public getRepositorySourceFilePaths = async (
+    projectId: number,
+    ref: string,
+    options?: { pathPrefix?: string; maxFiles?: number; },
+  ): Promise<string[]> => {
+    const response = await this.gitlab.Repositories.allRepositoryTrees(projectId, {
+      ref,
+      recursive: true,
+      perPage: options?.maxFiles ?? 200,
+    });
+
+    const data = Array.isArray(response) ? response : (response as { data?: { path?: string; type?: string }[] })?.data ?? response;
+    const items = Array.isArray(data) ? data : [];
+
+    const sourceExtensions = ['.ts', '.tsx', '.js', '.jsx', '.html'];
+    const pathPrefix = options?.pathPrefix ?? '';
+    const maxFiles = options?.maxFiles ?? 200;
+
+    const paths: string[] = [];
+
+    for (const item of items) {
+      const pathValue = (item as { path?: string }).path ?? '';
+      const typeValue = (item as { type?: string }).type ?? '';
+
+      if (typeValue !== 'blob' || !pathValue) {
+        continue;
+      }
+      const hasSourceExtension = sourceExtensions.some((extension) => pathValue.toLowerCase().endsWith(extension));
+      if (!hasSourceExtension) {
+        continue;
+      }
+      if (pathPrefix && !pathValue.startsWith(pathPrefix)) {
+        continue;
+      }
+      paths.push(pathValue);
+      if (paths.length >= maxFiles) {
+        break;
+      }
+    }
+
+    return paths;
+  };
+
+  public getFileContentAtRef = async (projectId: number, filePath: string, ref: string): Promise<string> =>
+    this.getFileContent(projectId, filePath, ref);
 
   public addComments = async (
     projectId: number,

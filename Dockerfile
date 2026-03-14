@@ -18,6 +18,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=builder /app/dist/src ./src
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/tsconfig.json ./
+COPY --from=builder /app/eslint.config.mjs ./
 EXPOSE 3013
 
 # Устанавливаем ENTRYPOINT для npm, чтобы CMD определял конкретный скрипт

@@ -128,11 +128,10 @@ export class CodeAnalyzerService {
       '.jsx',
     ].includes(extension);
 
-    // Security анализ
+    // Security и performance для всех файлов, в т.ч. .html
     const securityIssues = this.securityAnalyzer.analyze(content, filePath);
     issues.push(...securityIssues);
 
-    // Performance анализ
     const perfIssues = this.performanceAnalyzer.analyze(content, filePath);
     issues.push(...perfIssues);
 

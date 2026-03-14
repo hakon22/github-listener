@@ -78,11 +78,69 @@ export class GithubAgent {
 
     const result = await this.scmChangeBuilderService.buildSnapshotChanges(
       paths,
-      (filePath) => this.getFileContent(owner, repositoryName, filePath, ref),
+      (filePath) => this.getFileContentAtRef(owner, repositoryName, filePath, ref),
     );
 
     return result;
   };
+
+  public getRepositorySourceFilePaths = async (
+    owner: string,
+    repositoryName: string,
+    ref: string,
+    options?: { pathPrefix?: string; maxFiles?: number; },
+  ): Promise<string[]> => {
+    if (!owner || !repositoryName) {
+      throw new Error('Owner or repositoryName is not provided');
+    }
+
+    const { data: commit } = await this.octokit.repos.getCommit({
+      owner,
+      repo: repositoryName,
+      ref,
+    });
+
+    const treeSha = commit.commit.tree.sha;
+
+    const { data: tree } = await this.octokit.git.getTree({
+      owner,
+      repo: repositoryName,
+      tree_sha: treeSha,
+      recursive: 'true',
+    });
+
+    const sourceExtensions = ['.ts', '.tsx', '.js', '.jsx', '.html'];
+    const pathPrefix = options?.pathPrefix ?? '';
+    const maxFiles = options?.maxFiles ?? 200;
+
+    const paths: string[] = [];
+
+    for (const item of tree.tree ?? []) {
+      if (item.type !== 'blob' || !item.path) {
+        continue;
+      }
+      const hasSourceExtension = sourceExtensions.some((extension) => item.path!.toLowerCase().endsWith(extension));
+      if (!hasSourceExtension) {
+        continue;
+      }
+      if (pathPrefix && !item.path.startsWith(pathPrefix)) {
+        continue;
+      }
+      paths.push(item.path);
+      if (paths.length >= maxFiles) {
+        break;
+      }
+    }
+
+    return paths;
+  };
+
+  public getFileContentAtRef = async (
+    owner: string,
+    repositoryName: string,
+    filePath: string,
+    ref: string,
+  ): Promise<string> => this.getFileContent(owner, repositoryName, filePath, ref);
 
   private getFileContent = async (owner: string, repositoryName: string, filePath: string, ref: string): Promise<string> => {
     if (!owner || !repositoryName) {
