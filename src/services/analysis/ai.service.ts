@@ -1,3 +1,4 @@
+import * as path from 'path';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
 import { ModelBaseService } from '@/services/core/model-base.service';
 
@@ -5,8 +6,16 @@ import { Container, Singleton } from 'typescript-ioc';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { StringOutputParser } from '@langchain/core/output_parsers';
 import { RunnableSequence } from '@langchain/core/runnables';
+import ts from 'typescript';
 import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
+
+export type GetFileContentFn = (filePath: string) => Promise<string>;
+
+interface TsconfigPathsInterface {
+  baseUrl: string;
+  paths: Record<string, string[]>;
+}
 
 export interface AICodeIssueRecommendation extends CodeIssueInterface {
   type: 'quality' | 'security' | 'performance' | 'best_practice';
@@ -39,6 +48,8 @@ interface SummaryChangeItem {
 @Singleton
 export class AIService extends ModelBaseService {
   private readonly codeReviewPrompt: PromptTemplate;
+
+  private readonly logicalDataLoadingPrompt: PromptTemplate;
 
   private readonly pushSummaryPrompt: PromptTemplate;
 
@@ -98,6 +109,10 @@ export class AIService extends ModelBaseService {
           (без новых параметров, с устаревшим порядком аргументов и т.п.).
         - Если риск существенный (ошибки выполнения, падения, некорректная бизнес-логика) — обязательно выдели это как важную рекомендацию.
       
+      - Если rule === "logical-query-result-mismatch":
+        - это проблема, найденная логическим анализом ИИ: код обращается к полям/связям результата запроса, которые, по смыслу кода запроса, не загружаются (TypeORM relations/join, Knex select/join, raw SQL, Prisma include/select и т.д.). В рантайме — undefined или ошибка.
+        - Рекомендация: добавить недостающие поля/связи в выборку. Выдели это как критичную ошибку в "impact".
+      
       Для КАЖДОЙ входной проблемы верни ОДИН элемент массива JSON СТРОГО такого вида:
       [
         {{
@@ -112,10 +127,34 @@ export class AIService extends ModelBaseService {
       ТРЕБОВАНИЯ:
       - Пиши ТОЛЬКО по-русски.
       - Не выдумывай детали, которых нет в коде.
-      - Будь особенно внимателен к проблемам с rule "logical-entity-schema-change" и "logical-function-signature-change":
+      - Будь особенно внимателен к проблемам с rule "logical-entity-schema-change", "logical-function-signature-change" и "logical-query-result-mismatch":
         если виден потенциальный продакшн-риск, явно опиши его в поле "impact" и сделай "message"/"suggestion" максимально конкретными.
       - Не используй Markdown и текст вне JSON.
       - Выведи ТОЛЬКО JSON-массив без лишнего текста.
+    `);
+
+    this.logicalDataLoadingPrompt = PromptTemplate.fromTemplate(`
+      Ты — опытный ревьюер кода. Выполни логический анализ загрузки данных.
+      
+      Тебе переданы файлы (поле "file" — путь, "content" — содержимое). Часть из них — изменённые в MR/коммите, часть — файлы, в которые из изменённых передаётся результат запроса (импортируемые модули). Все их нужно анализировать вместе.
+      
+      В файлах могут быть запросы к БД: TypeORM (findOne/find с relations, createQueryBuilder с join'ами), Knex, raw SQL, Prisma, Drizzle и т.д. Результат запроса может сохраняться в переменную и передаваться в другую функцию — в том числе в функцию из другого файла. Обращение к полям/связям может быть как в том же файле, где запрос, так и в файле, куда переменная передана параметром.
+      
+      Задача: найди все места, где к результату запроса (или к аргументу, в который он передан) обращаются по свойствам/связям, которые запрос не загружает (включая обход массивов и вложенные поля). Это приведёт к undefined или ошибке в рантайме.
+      
+      Файлы для анализа (JSON-массив объектов с полями "file", "content"):
+      {files}
+      
+      Верни JSON-массив проблем СТРОГО такого вида (если проблем нет — пустой массив []):
+      [
+        {{ "file": "путь/к/файлу", "line": номер_строки_где_обращение_к_данным, "message": "краткое описание по-русски" }}
+      ]
+      
+      ТРЕБОВАНИЯ:
+      - Пиши ТОЛЬКО по-русски в поле message.
+      - Указывай реальные file и line по коду (в том числе в файле, куда передана константа).
+      - Не выдумывай проблем: только явное несоответствие «запрос не подгружает X, а код читает X».
+      - Выведи ТОЛЬКО JSON-массив без Markdown и текста вне JSON.
     `);
       
     this.pushSummaryPrompt = PromptTemplate.fromTemplate(`
@@ -231,6 +270,212 @@ export class AIService extends ModelBaseService {
         // preserve rule and file/line from original issue
       };
     });
+  };
+
+  /**
+   * Логический анализ загрузки данных: модель проверяет, что код не обращается к полям/связям,
+   * которые не загружаются запросом (любой стиль: TypeORM, Knex, Prisma, raw SQL и т.д.).
+   * Если передан getFileContent, в контекст добавляются файлы, импортируемые из изменённых
+   * (куда может прокидываться результат запроса).
+   */
+  public getLogicalDataLoadingIssues = async (changes: ScmChangeInterface[], getFileContent?: GetFileContentFn): Promise<CodeIssueInterface[]> => {
+    const allowedExtensions = ['.ts', '.tsx'];
+    const filesPayload: { file: string; content: string; }[] = [];
+    const seenPaths = new Set<string>();
+    let totalChars = 0;
+
+    for (const change of changes) {
+      const extension = change.file.slice(change.file.lastIndexOf('.')).toLowerCase();
+      if (!allowedExtensions.includes(extension) || !change.newContent?.trim()) {
+        continue;
+      }
+      const content = change.newContent.slice(0, 12000);
+      if (totalChars + content.length > AIService.MAX_CHARS_PER_BATCH) {
+        break;
+      }
+      const normalizedPath = path.normalize(change.file).replace(/\\/g, '/');
+      if (!seenPaths.has(normalizedPath)) {
+        seenPaths.add(normalizedPath);
+        filesPayload.push({ file: change.file, content });
+        totalChars += content.length;
+      }
+    }
+
+    if (getFileContent && filesPayload.length) {
+      const tsconfigPaths = await this.loadTsconfigPaths(getFileContent);
+      const pathResolver = this.buildPathResolver(tsconfigPaths);
+      const importedPaths = this.collectImportedPathsFromChanges(changes, pathResolver);
+      for (const resolvedPathBase of importedPaths) {
+        if (totalChars >= AIService.MAX_CHARS_PER_BATCH) {
+          break;
+        }
+        if (resolvedPathBase.includes('node_modules')) {
+          continue;
+        }
+        let content: string | null = null;
+        let resolvedWithExt = '';
+        for (const extension of ['.ts', '.tsx']) {
+          const candidate = resolvedPathBase + extension;
+          const normalized = path.normalize(candidate).replace(/\\/g, '/');
+          if (seenPaths.has(normalized)) {
+            content = null;
+            break;
+          }
+          try {
+            content = await getFileContent(candidate);
+            resolvedWithExt = candidate;
+            break;
+          } catch {
+            continue;
+          }
+        }
+        if (content && content.trim() && resolvedWithExt) {
+          const slice = content.slice(0, 12000);
+          if (totalChars + slice.length <= AIService.MAX_CHARS_PER_BATCH) {
+            seenPaths.add(path.normalize(resolvedWithExt).replace(/\\/g, '/'));
+            filesPayload.push({ file: resolvedWithExt, content: slice });
+            totalChars += slice.length;
+          }
+        }
+      }
+    }
+
+    if (filesPayload.length === 0) {
+      return [];
+    }
+
+    const llm = await this.getLlm();
+    const chain = RunnableSequence.from([
+      this.logicalDataLoadingPrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
+
+    const result = await chain.invoke({
+      files: JSON.stringify(filesPayload),
+    });
+
+    let items: Array<{ file: string; line: number; message: string }> = [];
+
+    try {
+      const jsonText = this.extractJsonPayload(result);
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (Array.isArray(parsed)) {
+        items = parsed.filter(
+          (item): item is { file: string; line: number; message: string } =>
+            typeof item === 'object' &&
+            item !== null &&
+            'file' in item &&
+            'line' in item &&
+            'message' in item,
+        );
+      }
+    } catch {
+      return [];
+    }
+
+    return items.map((item) => ({
+      file: item.file,
+      line: item.line,
+      severity: 'error' as const,
+      message: item.message,
+      rule: 'logical-query-result-mismatch',
+    }));
+  };
+
+  /** Пытается загрузить baseUrl и paths из tsconfig.json в корне репозитория. */
+  private loadTsconfigPaths = async (getFileContent: GetFileContentFn): Promise<TsconfigPathsInterface | null> => {
+    try {
+      const raw = await getFileContent('tsconfig.json');
+      const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '');
+      const json = JSON.parse(stripped) as { compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> } };
+      const baseUrl = json.compilerOptions?.baseUrl ?? '';
+      const paths = json.compilerOptions?.paths;
+      if (!paths || typeof paths !== 'object') {
+        return baseUrl ? { baseUrl, paths: {} } : null;
+      }
+      return { baseUrl, paths };
+    } catch {
+      return null;
+    }
+  };
+
+  /** Строит резолвер: (specifier, fromFile) => путь без расширения или null. */
+  private buildPathResolver = (tsconfig: TsconfigPathsInterface | null): (specifier: string, fromFile: string) => string | null => {
+    return (specifier: string, fromFile: string): string | null => {
+      if (specifier.startsWith('.')) {
+        const dir = path.posix.dirname(fromFile);
+        return path.posix.normalize(path.posix.join(dir, specifier));
+      }
+      if (tsconfig) {
+        const sortedKeys = Object.keys(tsconfig.paths).sort((a, b) => b.length - a.length);
+        for (const pattern of sortedKeys) {
+          const mappings = tsconfig.paths[pattern];
+          if (!Array.isArray(mappings) || mappings.length === 0) {
+            continue;
+          }
+          const prefix = pattern.replace(/\*$/, '');
+          if (prefix !== pattern && specifier.startsWith(prefix)) {
+            const rest = specifier.slice(prefix.length);
+            const template = mappings[0];
+            const resolved = template.includes('*') ? template.replace('*', rest) : template;
+            const base = tsconfig.baseUrl ? path.posix.normalize(tsconfig.baseUrl) : '';
+            return base ? path.posix.join(base, resolved) : path.posix.normalize(resolved);
+          }
+          if (pattern === specifier || (pattern.endsWith('*') && specifier.startsWith(pattern.slice(0, -1)))) {
+            const template = mappings[0];
+            const rest = pattern.endsWith('*') ? specifier.slice(pattern.length - 1) : '';
+            const resolved = template.includes('*') ? template.replace('*', rest) : template;
+            const base = tsconfig.baseUrl ? path.posix.normalize(tsconfig.baseUrl) : '';
+            return base ? path.posix.join(base, resolved) : path.posix.normalize(resolved);
+          }
+        }
+      }
+      // Только алиас @/ считаем путём внутри репозитория; @scope/name — внешние npm-пакеты, не резолвим
+      if (specifier.startsWith('@/')) {
+        return path.posix.normalize('src/' + specifier.slice(2));
+      }
+      return null;
+    };
+  };
+
+  /** Собирает пути файлов, импортируемых из изменённых (относительные и алиасы), без расширения. */
+  private collectImportedPathsFromChanges = (
+    changes: ScmChangeInterface[],
+    pathResolver: (specifier: string, fromFile: string) => string | null,
+  ): string[] => {
+    const allowedExtensions = ['.ts', '.tsx'];
+    const resultSet = new Set<string>();
+
+    for (const change of changes) {
+      const extension = change.file.slice(change.file.lastIndexOf('.')).toLowerCase();
+      if (!allowedExtensions.includes(extension) || !change.newContent?.trim()) {
+        continue;
+      }
+      const sourceFile = ts.createSourceFile(
+        change.file,
+        change.newContent,
+        ts.ScriptTarget.Latest,
+        true,
+      );
+
+      const visit = (node: ts.Node): void => {
+        if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+          const specifier = node.moduleSpecifier.text;
+          if (specifier.includes('node_modules') || (specifier.length > 0 && !specifier.startsWith('.') && !specifier.startsWith('@') && !specifier.includes('/'))) {
+            return;
+          }
+          const resolved = pathResolver(specifier, change.file);
+          if (resolved) {
+            resultSet.add(resolved);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+    }
+
+    return Array.from(resultSet);
   };
 
   public generateTestCases = async (code: string): Promise<string[]> => {

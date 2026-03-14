@@ -2,7 +2,7 @@ import * as path from 'path';
 import { Container, Singleton } from 'typescript-ioc';
 
 import { AIService } from '@/services/analysis/ai.service';
-import type { AICodeIssueRecommendation } from '@/services/analysis/ai.service';
+import type { AICodeIssueRecommendation, GetFileContentFn } from '@/services/analysis/ai.service';
 import { CodeAnalyzerService } from '@/services/analysis/code-analyzer.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
@@ -39,8 +39,9 @@ export class ScmReviewService {
     changes: ScmChangeInterface[],
     commits: ScmCommitSummaryInterface[],
     summaryTitle: string,
+    options?: { getFileContent?: GetFileContentFn; },
   ): Promise<{ analysisSummary: string; humanSummary: string; }> => {
-    const recommendations = await this.getRecommendationsForChanges(changes);
+    const recommendations = await this.getRecommendationsForChanges(changes, options?.getFileContent);
     const categorizedRecommendations = this.categorizeRecommendations(recommendations);
 
     const topIssues = [
@@ -69,11 +70,14 @@ export class ScmReviewService {
 
   public getRecommendationsForChanges = async (
     changes: ScmChangeInterface[],
+    getFileContent?: GetFileContentFn,
   ): Promise<AICodeIssueRecommendation[]> => {
     await this.vectorStoreService.indexMergeRequestChanges(changes);
 
     const analysis = await this.analyzerService.analyzeChanges(changes);
-    return this.aiService.getRecommendations(analysis);
+    const logicalDataIssues = await this.aiService.getLogicalDataLoadingIssues(changes, getFileContent);
+    const allIssues = [...analysis, ...logicalDataIssues];
+    return this.aiService.getRecommendations(allIssues);
   };
 
   public buildAnalysisErrorSummary = (error: unknown): string => {

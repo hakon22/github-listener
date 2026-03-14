@@ -232,15 +232,22 @@ export class GithubWebhookController extends BaseService {
             );
             mergedChanges = [...changes, ...affectedChanges];
           }
-        } catch {
-          // fallback: analyze only changed files
+        } catch (error) {
+          this.loggerService.warn(this.TAG, 'Impact analysis failed for PR, analyzing only changed files', error);
         }
       }
 
+      const getFileContent = (filePath: string) => this.githubAgent.getFileContentAtRef(
+        repositoryOwner,
+        event.repository.name,
+        filePath,
+        ref,
+      );
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
         [],
         '<b>Результаты анализа кода по Pull Request</b>',
+        { getFileContent },
       );
 
       analysisSummary = analysisResult.analysisSummary;

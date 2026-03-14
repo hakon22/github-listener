@@ -66,10 +66,12 @@ export class ScmPushAnalysisService {
         }
       }
 
+      const getFileContent = driver.getAffectedPathsInput().getFileContent;
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
         commits,
         summaryTitle,
+        { getFileContent },
       );
 
       const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);

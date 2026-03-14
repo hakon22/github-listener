@@ -81,11 +81,17 @@ export class GitlabWebhookController extends BaseService {
   private handleMergeRequest = async (event: GitlabMergeRequestEvent): Promise<void> => {
     const projectId = event.project.id;
     const mergeRequestIid = event.object_attributes.iid;
+    const ref = (event.object_attributes.source_branch as string) ?? 'main';
 
     this.loggerService.info(this.TAG, `Processing GitLab merge_request: projectId=${projectId}, MR !${mergeRequestIid}`);
 
     const changes = await this.gitlabAgentService.getMergeRequestChanges(projectId, mergeRequestIid);
-    const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes);
+    const getFileContent = (filePath: string) => this.gitlabAgentService.getFileContentAtRef(
+      projectId,
+      filePath,
+      ref,
+    );
+    const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes, getFileContent);
 
     await this.gitlabAgentService.addComments(projectId, mergeRequestIid, recommendations);
 
