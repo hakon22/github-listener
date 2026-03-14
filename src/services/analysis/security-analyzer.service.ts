@@ -5,8 +5,6 @@ interface SecurityRule {
   pattern: RegExp;
   message: string;
   severity: CodeIssueInterface['severity'];
-  /** Для правила «захардкоженные секреты» — сравниваемое значение не считается секретом, если оно в этом списке */
-  skipWhenValueEquals?: string[];
 }
 
 @Singleton
@@ -21,12 +19,6 @@ export class SecurityAnalyzerService {
       pattern: /child_process\.execSync/,
       message: 'Use child_process.execFile for better security',
       severity: 'warning',
-    },
-    {
-      pattern: /process\.env\.([A-Z_]+)\s*[!=]==?\s*['"]([^'"]*)['"]/g,
-      message: 'Hardcoded secrets in code',
-      severity: 'error',
-      skipWhenValueEquals: ['true', 'false', ''],
     },
     {
       pattern: /\.innerHTML\s*=/,
@@ -45,12 +37,6 @@ export class SecurityAnalyzerService {
 
       for (const match of matchIterator) {
         const fullMatch = match[0];
-        const comparedValue = match[2];
-
-        if (rule.skipWhenValueEquals && typeof comparedValue === 'string' && rule.skipWhenValueEquals.includes(comparedValue)) {
-          continue;
-        }
-
         const lineIndex = lines.findIndex((line) => line.includes(fullMatch));
         if (lineIndex !== -1) {
           issues.push({

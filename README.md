@@ -26,6 +26,18 @@
 - **Безопасность и производительность** — `SecurityAnalyzerService`, `PerformanceAnalyzerService`.
 - **Логические изменения** — изменения сигнатур и схем сущностей.
 
+#### Правила проверки безопасности (SecurityAnalyzerService)
+
+Набор правил задаётся в `src/services/analysis/security-analyzer.service.ts` в массиве `dangerousPatterns`. Каждое правило содержит регулярное выражение, сообщение и уровень серьёзности (`error` или `warning`). По умолчанию проверяются:
+
+| Паттерн | Сообщение | Уровень |
+|--------|-----------|---------|
+| `eval(` | Avoid using eval() - security risk | error |
+| `child_process.execSync` | Use child_process.execFile for better security | warning |
+| `.innerHTML =` | Potential XSS vulnerability | warning |
+
+Чтобы отключить правило — удалите или закомментируйте соответствующий объект в `dangerousPatterns`. Чтобы добавить своё — добавьте объект с полями `pattern` (RegExp), `message` (string), `severity` (`'error'` или `'warning'`).
+
 #### Отключение или ослабление правил ESLint (в т.ч. проверки на `any`)
 
 В конструкторе `CodeAnalyzerService` конфиг ESLint собирается в `baseConfig`. Чтобы отключить или изменить правило, добавьте в массив `baseConfig` объект с переопределением `rules` **после** конфигов TypeScript (чтобы переопределение имело приоритет):
