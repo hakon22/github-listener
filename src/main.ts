@@ -10,6 +10,7 @@ import { RouterService } from '@/services/core/router.service';
 import { LoggerService } from '@/services/core/logger.service';
 
 class Main {
+  private readonly TAG = 'Main';
 
   private readonly telegramBotService = Container.get(TelegramBotService);
 
@@ -28,6 +29,7 @@ class Main {
       limit: '50mb',
       strict: false,
       verify: (_req, _res, buf, encoding) => this.loggerService.debug(
+        this.TAG,
         `Received GitHub/GitLab webhook:\n${buf.toString(<BufferEncoding>encoding)}`,
       ),
     }));
@@ -38,6 +40,8 @@ class Main {
   };
 
   public async start(): Promise<void> {
+    this.loggerService.info(this.TAG, 'Starting application...');
+
     await this.telegramBotService.init();
 
     const bot = this.telegramBotService.getBot();
@@ -45,17 +49,35 @@ class Main {
     this.configureExpress();
 
     this.app.listen(this.port, () => {
-      console.log(`GitLab/GitHub webhook server is running on port ${this.port}`);
+      this.loggerService.info(this.TAG, `GitLab/GitHub webhook server is running on port ${this.port}`);
     });
 
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    const shutdown = (signal: string) => {
+      this.loggerService.info(this.TAG, `Received ${signal}, shutting down`);
+      try {
+        bot.stop(signal);
+      } catch (error) {
+        const errorInstance = error as Error;
+        if (errorInstance.message !== 'Bot is not running!') {
+          this.loggerService.error(this.TAG, 'Error stopping bot', errorInstance);
+        }
+      }
+      process.exit(0);
+    };
+
+    process.once('SIGINT', () => shutdown('SIGINT'));
+    process.once('SIGTERM', () => shutdown('SIGTERM'));
   }
 }
 
 new Main()
   .start()
-  .catch((e: unknown) => {
-    console.error(e);
+  .catch((error: unknown) => {
+    try {
+      Container.get(LoggerService).error('Main', 'Application failed to start', error);
+    } catch {
+      console.error('Application failed to start', error);
+    }
+    process.exit(1);
   });
 

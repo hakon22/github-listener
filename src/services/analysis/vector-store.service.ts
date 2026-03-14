@@ -12,6 +12,8 @@ interface CodeVectorEntry {
 
 @Singleton
 export class VectorStoreService extends ModelBaseService {
+  protected override readonly TAG: string = 'VectorStoreService';
+
   private embeddings: OpenAIEmbeddings | null = null;
 
   private vectors: CodeVectorEntry[] = [];
@@ -57,8 +59,11 @@ export class VectorStoreService extends ModelBaseService {
   public indexMergeRequestChanges = async (changes: ScmChangeInterface[]): Promise<void> => {
     if (!changes.length) {
       this.vectors = [];
+      this.loggerService.debug(this.TAG, 'indexMergeRequestChanges: no changes, clearing vectors');
       return;
     }
+
+    this.loggerService.info(this.TAG, `Indexing ${changes.length} file changes for embeddings`);
 
     // Разбиваем большие файлы на чанки, чтобы не превышать лимит токенов модели.
     const items: { file: string; content: string; }[] = [];
@@ -105,15 +110,10 @@ export class VectorStoreService extends ModelBaseService {
       }
 
       this.vectors = vectors;
+      this.loggerService.info(this.TAG, `Embeddings built successfully: ${vectors.length} vectors`);
     } catch (error) {
       const errorInstance = error as Error;
-      this.loggerService.error('Failed to build embeddings for GitLab changes', {
-        error: {
-          name: errorInstance?.name || String(error),
-          message: errorInstance?.message || String(error),
-          stack: errorInstance?.stack,
-        },
-      });
+      this.loggerService.error(this.TAG, 'Failed to build embeddings for GitLab changes', errorInstance);
 
       // В случае ошибок Mistral просто отключаем векторный поиск для этого пуша,
       // чтобы не ломать весь пайплайн анализа.
@@ -146,13 +146,7 @@ export class VectorStoreService extends ModelBaseService {
         .slice(0, limit);
     } catch (error) {
       const errorInstance = error as Error;
-      this.loggerService.error('Failed to compute embedding for GitLab query', {
-        error: {
-          name: errorInstance?.name || String(error),
-          message: errorInstance?.message || String(error),
-          stack: errorInstance?.stack,
-        },
-      });
+      this.loggerService.error(this.TAG, 'Failed to compute embedding for GitLab query', errorInstance);
 
       // Если Mistral недоступен, просто не используем поиск похожего кода.
       return [];

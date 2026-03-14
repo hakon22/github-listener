@@ -18,6 +18,35 @@
 - **Impact analysis (затронутые файлы)**: помимо файлов из коммита/PR анализируются файлы, которые импортируют изменённые модули (по графу относительных импортов). Содержимое подгружается из репозитория по API; лимиты: до 200 файлов при обходе дерева, до 50 дополнительных затронутых файлов.
 - **Управление**: переменная окружения `IMPACT_ANALYSIS_ENABLED` — при значении `false` анализ затронутых файлов отключается, анализируются только изменённые (см. раздел «Переменные окружения»).
 
+### Настройка проверок
+
+Проверки при анализе кода задаются в `src/services/analysis/code-analyzer.service.ts`. Источники проблем:
+
+- **ESLint** — правила из `eslint:recommended` и `@typescript-eslint/recommended` (в т.ч. `@typescript-eslint/no-explicit-any`).
+- **Безопасность и производительность** — `SecurityAnalyzerService`, `PerformanceAnalyzerService`.
+- **Логические изменения** — изменения сигнатур и схем сущностей.
+
+#### Отключение или ослабление правил ESLint (в т.ч. проверки на `any`)
+
+В конструкторе `CodeAnalyzerService` конфиг ESLint собирается в `baseConfig`. Чтобы отключить или изменить правило, добавьте в массив `baseConfig` объект с переопределением `rules` **после** конфигов TypeScript (чтобы переопределение имело приоритет):
+
+```ts
+const baseConfig = [
+  js.configs.recommended,
+  ...(Array.isArray(tsRecommendedConfigs) ? tsRecommendedConfigs : [tsRecommendedConfigs]),
+  // Переопределение правил (добавить в конец):
+  {
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',  // отключить проверку на any
+      // '@typescript-eslint/no-explicit-any': 'warn',  // или сделать предупреждением
+      // другие правила по необходимости
+    },
+  },
+];
+```
+
+Список правил TypeScript-ESLint: [typescript-eslint.io/rules](https://typescript-eslint.io/rules).
+
 ---
 
 ## Стек
@@ -49,6 +78,9 @@
 - **GitHub**
   - `GITHUB_API_URL` — URL GitHub API.
   - `GITHUB_TOKEN` — доступ для GitHub API.
+- **Запросы к API GitHub/GitLab (опционально)**
+  - `API_REQUEST_TIMEOUT_MS` — таймаут одного HTTP‑запроса в мс (по умолчанию `30000`). Увеличьте при нестабильной сети или долгих ответах.
+  - `DELAY_BETWEEN_REQUESTS_MS` — минимальная задержка между запросами к API в мс (по умолчанию `200`). Снижает риск таймаутов и перегрузки API.
   - `GITHUB_SECRET` — secret GitHub API.
 - **Анализ кода**
   - `IMPACT_ANALYSIS_ENABLED` — при значении `false` отключается поиск и анализ затронутых файлов (по умолчанию включено).

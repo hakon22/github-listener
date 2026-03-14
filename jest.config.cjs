@@ -16,4 +16,7 @@ module.exports = {
     ],
   },
   clearMocks: true,
+  transformIgnorePatterns: [
+    'node_modules/(?!(@octokit/webhooks|@octokit/webhooks-methods)/)',
+  ],
 };

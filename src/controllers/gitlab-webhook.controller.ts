@@ -2,10 +2,10 @@ import type { Request, Response } from 'express';
 import { Container, Singleton } from 'typescript-ioc';
 
 import { BaseService } from '@/services/core/base.service';
-import { AffectedFilesService } from '@/services/analysis/affected-files.service';
 import { GitlabAgentService } from '@/services/scm/agents/gitlab-agent.service';
 import { ScmReviewService } from '@/services/scm/scm-review.service';
 import { ScmNotificationService } from '@/services/scm/scm-notification.service';
+import { ScmPushAnalysisService } from '@/services/scm/scm-push-analysis.service';
 
 interface GitlabMergeRequestEvent {
   object_kind: 'merge_request';
@@ -48,9 +48,11 @@ interface GitlabPushEvent {
 
 @Singleton
 export class GitlabWebhookController extends BaseService {
-  private readonly affectedFilesService = Container.get(AffectedFilesService);
+  protected override readonly TAG: string = 'GitlabWebhookController';
 
   private readonly gitlabAgentService = Container.get(GitlabAgentService);
+
+  private readonly scmPushAnalysisService = Container.get(ScmPushAnalysisService);
 
   private readonly scmReviewService = Container.get(ScmReviewService);
 
@@ -60,10 +62,14 @@ export class GitlabWebhookController extends BaseService {
     try {
       const eventKind = (req.body as { object_kind?: string; } | undefined)?.object_kind;
 
+      this.loggerService.info(this.TAG, `Received GitLab webhook: event=${eventKind ?? 'unknown'}`);
+
       if (eventKind === 'merge_request') {
         this.defer(() => this.handleMergeRequest(req.body as GitlabMergeRequestEvent));
       } else if (eventKind === 'push') {
         this.defer(() => this.handlePush(req.body as GitlabPushEvent));
+      } else {
+        this.loggerService.debug(this.TAG, `Ignored GitLab event: ${eventKind}`);
       }
 
       return res.status(200).json({ status: 'processing' });
@@ -76,10 +82,14 @@ export class GitlabWebhookController extends BaseService {
     const projectId = event.project.id;
     const mergeRequestIid = event.object_attributes.iid;
 
+    this.loggerService.info(this.TAG, `Processing GitLab merge_request: projectId=${projectId}, MR !${mergeRequestIid}`);
+
     const changes = await this.gitlabAgentService.getMergeRequestChanges(projectId, mergeRequestIid);
     const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes);
 
     await this.gitlabAgentService.addComments(projectId, mergeRequestIid, recommendations);
+
+    this.loggerService.info(this.TAG, `GitLab merge_request !${mergeRequestIid} processed, comments added`);
   };
 
   private handlePush = async (event: GitlabPushEvent): Promise<void> => {
@@ -91,100 +101,61 @@ export class GitlabWebhookController extends BaseService {
     const branch = event.ref.replace(/^refs\/heads\//, '');
     const author = event.user_name || event.user_username || 'неизвестен';
 
+    this.loggerService.info(this.TAG, `Processing GitLab push: project=${projectName}, branch=${branch}, author=${author}`);
+
     const commits = event.commits ?? [];
     const commitsCount = event.total_commits_count ?? commits.length;
 
     const changedFiles = this.scmReviewService.collectChangedFiles(commits);
     const filesCount = changedFiles.size;
+
     let analysisSummary = '';
     let humanSummary = '';
+    let commitsSummary = '';
 
-    try {
-      if (filesCount > 0) {
-        const changedPaths = Array.from(changedFiles);
-        const ref = event.after ?? branch;
+    if (filesCount > 0) {
+      const changedPaths = Array.from(changedFiles);
+      const ref = event.after ?? branch;
 
-        const changes = event.before && event.after
-          ? await this.gitlabAgentService.getPushChanges(
-            projectId,
-            event.before,
-            event.after,
-            changedPaths,
-          )
-          : await this.gitlabAgentService.getFilesSnapshot(
-            projectId,
-            branch,
-            changedPaths,
-          );
-
-        let mergedChanges = changes;
-
-        if (process.env.IMPACT_ANALYSIS_ENABLED !== 'false') {
-          try {
-            const affectedPaths = await this.affectedFilesService.getAffectedPaths(
-              changedPaths,
-              {
-                getSourceFilePaths: () => this.gitlabAgentService.getRepositorySourceFilePaths(
-                  projectId,
-                  ref,
-                  { maxFiles: 200 },
-                ),
-                getFileContent: (filePath) => this.gitlabAgentService.getFileContentAtRef(
-                  projectId,
-                  filePath,
-                  ref,
-                ),
-              },
-              { affectedFileLimit: 50 },
-            );
-
-            const changedSet = new Set(changedPaths);
-            const pathsToFetch = affectedPaths.filter((filePath) => !changedSet.has(filePath));
-
-            if (pathsToFetch.length > 0) {
-              const affectedChanges = await this.gitlabAgentService.getFilesSnapshot(
-                projectId,
-                ref,
-                pathsToFetch,
-              );
-              mergedChanges = [...changes, ...affectedChanges];
-            }
-          } catch {
-            // fallback: analyze only changed files
-          }
-        }
-
-        const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
-          mergedChanges,
-          commits.map((commit) => ({
-            id: commit.id,
-            message: commit.message,
-            files: [
-              ...(commit.added ?? []),
-              ...(commit.modified ?? []),
-              ...(commit.removed ?? []),
-            ],
-          })),
-          '<b>Результаты анализа кода</b>',
-        );
-
-        analysisSummary = analysisResult.analysisSummary;
-        humanSummary = analysisResult.humanSummary;
-      }
-    } catch (error) {
-      const errorInstance = error as Error;
-      this.loggerService.error('Failed to analyze code for push event', {
-        error: {
-          name: errorInstance?.name || String(error),
-          message: errorInstance?.message || String(error),
-          stack: errorInstance?.stack,
+      const result = await this.scmPushAnalysisService.run({
+        driver: {
+          getInitialChanges: () => (event.before && event.after
+            ? this.gitlabAgentService.getPushChanges(projectId, event.before, event.after, changedPaths)
+            : this.gitlabAgentService.getFilesSnapshot(projectId, branch, changedPaths)),
+          getSnapshot: (paths) => this.gitlabAgentService.getFilesSnapshot(projectId, ref, paths),
+          getAffectedPathsInput: () => ({
+            getSourceFilePaths: () => this.gitlabAgentService.getRepositorySourceFilePaths(
+              projectId,
+              ref,
+              { maxFiles: 200 },
+            ),
+            getFileContent: (filePath) => this.gitlabAgentService.getFileContentAtRef(
+              projectId,
+              filePath,
+              ref,
+            ),
+          }),
         },
+        changedPaths,
+        commits: commits.map((commit) => ({
+          id: commit.id,
+          message: commit.message,
+          files: [
+            ...(commit.added ?? []),
+            ...(commit.modified ?? []),
+            ...(commit.removed ?? []),
+          ],
+        })),
+        summaryTitle: '<b>Результаты анализа кода</b>',
+        errorContext: 'Failed to analyze code for GitLab push event',
       });
 
-      analysisSummary = this.scmReviewService.buildAnalysisErrorSummary(error);
+      analysisSummary = result.analysisSummary;
+      humanSummary = result.humanSummary;
+      commitsSummary = result.commitsSummary;
+    } else {
+      commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
     }
-
-    const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
 
     const messageText = this.scmNotificationService.buildPushNotificationText({
       providerName: 'GitLab',

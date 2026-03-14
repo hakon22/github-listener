@@ -1,0 +1,20 @@
+{
+  "object_kind": "merge_request",
+  "project": {
+    "id": 12345678,
+    "name": "github-listener",
+    "path_with_namespace": "hakon22/github-listener",
+    "web_url": "https://gitlab.com/hakon22/github-listener"
+  },
+  "object_attributes": {
+    "iid": 42,
+    "title": "feat: add new analysis flow",
+    "state": "opened",
+    "source_branch": "feature/analysis",
+    "target_branch": "main"
+  },
+  "user": {
+    "username": "hakon22",
+    "name": "Aleksey"
+  }
+}

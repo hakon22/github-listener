@@ -5,6 +5,8 @@ interface SecurityRule {
   pattern: RegExp;
   message: string;
   severity: CodeIssueInterface['severity'];
+  /** Для правила «захардкоженные секреты» — сравниваемое значение не считается секретом, если оно в этом списке */
+  skipWhenValueEquals?: string[];
 }
 
 @Singleton
@@ -21,9 +23,10 @@ export class SecurityAnalyzerService {
       severity: 'warning',
     },
     {
-      pattern: /process\.env\.([A-Z_]+)\s*[!=]==?\s*['"`]/,
+      pattern: /process\.env\.([A-Z_]+)\s*[!=]==?\s*['"]([^'"]*)['"]/g,
       message: 'Hardcoded secrets in code',
       severity: 'error',
+      skipWhenValueEquals: ['true', 'false', ''],
     },
     {
       pattern: /\.innerHTML\s*=/,
@@ -34,17 +37,21 @@ export class SecurityAnalyzerService {
 
   public analyze = (content: string, filePath: string): CodeIssueInterface[] => {
     const issues: CodeIssueInterface[] = [];
+    const lines = content.split('\n');
 
     for (const rule of this.dangerousPatterns) {
-      const matches = content.match(rule.pattern);
-      if (!matches) {
-        continue;
-      }
+      const pattern = rule.pattern.global ? rule.pattern : new RegExp(rule.pattern.source, 'g');
+      const matchIterator = content.matchAll(pattern);
 
-      const lines = content.split('\n');
+      for (const match of matchIterator) {
+        const fullMatch = match[0];
+        const comparedValue = match[2];
 
-      matches.forEach((match) => {
-        const lineIndex = lines.findIndex((line) => line.includes(match));
+        if (rule.skipWhenValueEquals && typeof comparedValue === 'string' && rule.skipWhenValueEquals.includes(comparedValue)) {
+          continue;
+        }
+
+        const lineIndex = lines.findIndex((line) => line.includes(fullMatch));
         if (lineIndex !== -1) {
           issues.push({
             file: filePath,
@@ -54,7 +61,7 @@ export class SecurityAnalyzerService {
             rule: 'security-pattern',
           });
         }
-      });
+      }
     }
 
     return issues;

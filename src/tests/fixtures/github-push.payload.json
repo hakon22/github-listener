@@ -1,0 +1,78 @@
+{
+  "ref": "refs/heads/production",
+  "before": "172ff123e1bb582ea63de5bd8f7614e3dd1b89a5",
+  "after": "8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+  "repository": {
+    "id": 1178317321,
+    "node_id": "R_kgDORjuyCQ",
+    "name": "github-listener",
+    "full_name": "hakon22/github-listener",
+    "private": false,
+    "owner": {
+      "name": "hakon22",
+      "email": "111744315+hakon22@users.noreply.github.com",
+      "login": "hakon22",
+      "id": 111744315,
+      "node_id": "U_kgDOBqkVOw",
+      "avatar_url": "https://avatars.githubusercontent.com/u/111744315?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/hakon22",
+      "html_url": "https://github.com/hakon22",
+      "type": "User",
+      "site_admin": false
+    },
+    "html_url": "https://github.com/hakon22/github-listener",
+    "url": "https://api.github.com/repos/hakon22/github-listener",
+    "default_branch": "main"
+  },
+  "pusher": {
+    "name": "hakon22",
+    "email": "111744315+hakon22@users.noreply.github.com"
+  },
+  "sender": {
+    "login": "hakon22",
+    "id": 111744315,
+    "type": "User"
+  },
+  "created": false,
+  "deleted": false,
+  "commits": [
+    {
+      "id": "8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+      "tree_id": "5918ef61a927dbd4039bef03bb57b6fa1d330a8d",
+      "distinct": true,
+      "message": "feat: улучшение логики анализа",
+      "timestamp": "2026-03-14T18:36:51+03:00",
+      "url": "https://github.com/hakon22/github-listener/commit/8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+      "author": {
+        "name": "Aleksey",
+        "email": "hakon1@mail.ru",
+        "username": "hakon22"
+      },
+      "committer": {
+        "name": "Aleksey",
+        "email": "hakon1@mail.ru",
+        "username": "hakon22"
+      },
+      "added": ["src/services/analysis/affected-files.service.ts"],
+      "removed": [],
+      "modified": [
+        ".gitignore",
+        "Dockerfile",
+        "README.md",
+        "package.json",
+        "src/controllers/github-webhook.controller.ts"
+      ]
+    }
+  ],
+  "head_commit": {
+    "id": "8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+    "message": "feat: улучшение логики анализа",
+    "timestamp": "2026-03-14T18:36:51+03:00",
+    "author": { "name": "Aleksey", "email": "hakon1@mail.ru", "username": "hakon22" },
+    "committer": { "name": "Aleksey", "email": "hakon1@mail.ru", "username": "hakon22" },
+    "added": ["src/services/analysis/affected-files.service.ts"],
+    "removed": [],
+    "modified": [".gitignore", "Dockerfile", "README.md", "package.json", "src/controllers/github-webhook.controller.ts"]
+  }
+}

@@ -2,6 +2,8 @@ import type { Request, Response } from 'express';
 import { Container } from 'typescript-ioc';
 
 import { GitlabWebhookController } from '@/controllers/gitlab-webhook.controller';
+import gitlabPushPayload from './fixtures/gitlab-push.payload.json';
+import gitlabMergeRequestPayload from './fixtures/gitlab-merge-request.payload.json';
 import { GitlabAgentService } from '@/services/scm/agents/gitlab-agent.service';
 import { CodeAnalyzerService } from '@/services/analysis/code-analyzer.service';
 import { AIService } from '@/services/analysis/ai.service';
@@ -81,9 +83,7 @@ describe('GitlabWebhookController', () => {
     ).mockResolvedValue(undefined);
 
     const request = {
-      body: {
-        object_kind: 'push',
-      },
+      body: gitlabPushPayload,
     } as Request;
     const response = createResponse();
 
@@ -96,6 +96,7 @@ describe('GitlabWebhookController', () => {
     expect((response as unknown as { statusCode: number; }).statusCode).toBe(200);
     expect((response as unknown as { payload: unknown; }).payload).toEqual({ status: 'processing' });
     expect(handlePushSpy).toHaveBeenCalledTimes(1);
+    expect(handlePushSpy).toHaveBeenCalledWith(gitlabPushPayload);
   });
 
   it('returns processing for GitLab merge request events and defers handling', async () => {
@@ -106,9 +107,7 @@ describe('GitlabWebhookController', () => {
     ).mockResolvedValue(undefined);
 
     const request = {
-      body: {
-        object_kind: 'merge_request',
-      },
+      body: gitlabMergeRequestPayload,
     } as Request;
     const response = createResponse();
 
@@ -121,7 +120,7 @@ describe('GitlabWebhookController', () => {
     expect((response as unknown as { statusCode: number; }).statusCode).toBe(200);
     expect((response as unknown as { payload: unknown; }).payload).toEqual({ status: 'processing' });
     expect(handleMergeRequestSpy).toHaveBeenCalledTimes(1);
+    expect(handleMergeRequestSpy).toHaveBeenCalledWith(gitlabMergeRequestPayload);
   });
-}
-);
+});
 

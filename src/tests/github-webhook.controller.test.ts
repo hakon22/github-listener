@@ -2,12 +2,20 @@ import type { Request, Response } from 'express';
 import { Container } from 'typescript-ioc';
 
 import { GithubWebhookController } from '@/controllers/github-webhook.controller';
+import githubPushPayload from './fixtures/github-push.payload.json';
+import githubPullRequestPayload from './fixtures/github-pull-request.payload.json';
 import { GithubAgent } from '@/services/scm/agents/github-agent.service';
 import { CodeAnalyzerService } from '@/services/analysis/code-analyzer.service';
 import { AIService } from '@/services/analysis/ai.service';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
 import { TelegramService } from '@/services/notifications/telegram.service';
 import { LoggerService } from '@/services/core/logger.service';
+
+jest.mock('@octokit/webhooks', () => ({
+  Webhooks: class Webhooks {
+    verify = jest.fn().mockResolvedValue(true);
+  },
+}));
 
 jest.mock('@/services/scm/agents/github-agent.service', () => ({
   GithubAgent: class GithubAgent {},
@@ -83,12 +91,13 @@ describe('GithubWebhookController', () => {
     const request = {
       headers: {
         'x-github-event': 'push',
+        'x-hub-signature-256': 'sha256=test-signature',
       },
-      body: {},
+      body: githubPushPayload,
     } as unknown as Request;
     const response = createResponse();
 
-    controller.onWebhookMessage(request, response);
+    await controller.onWebhookMessage(request, response);
 
     await new Promise<void>((resolve) => {
       setImmediate(() => resolve());
@@ -97,6 +106,7 @@ describe('GithubWebhookController', () => {
     expect((response as unknown as { statusCode: number; }).statusCode).toBe(200);
     expect((response as unknown as { payload: unknown; }).payload).toEqual({ status: 'processing' });
     expect(handlePushSpy).toHaveBeenCalledTimes(1);
+    expect(handlePushSpy).toHaveBeenCalledWith(githubPushPayload);
   });
 
   it('returns processing for GitHub pull request events and defers handling', async () => {
@@ -109,12 +119,13 @@ describe('GithubWebhookController', () => {
     const request = {
       headers: {
         'x-github-event': 'pull_request',
+        'x-hub-signature-256': 'sha256=test-signature',
       },
-      body: {},
+      body: githubPullRequestPayload,
     } as unknown as Request;
     const response = createResponse();
 
-    controller.onWebhookMessage(request, response);
+    await controller.onWebhookMessage(request, response);
 
     await new Promise<void>((resolve) => {
       setImmediate(() => resolve());
@@ -123,7 +134,7 @@ describe('GithubWebhookController', () => {
     expect((response as unknown as { statusCode: number; }).statusCode).toBe(200);
     expect((response as unknown as { payload: unknown; }).payload).toEqual({ status: 'processing' });
     expect(handlePullRequestSpy).toHaveBeenCalledTimes(1);
+    expect(handlePullRequestSpy).toHaveBeenCalledWith(githubPullRequestPayload);
   });
-}
-);
+});
 

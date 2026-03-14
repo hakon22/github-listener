@@ -1,11 +1,20 @@
+import { createRequire } from 'node:module';
+import * as path from 'path';
 import { Container, Singleton } from 'typescript-ioc';
 import { SecurityAnalyzerService } from '@/services/analysis/security-analyzer.service';
 import { PerformanceAnalyzerService } from '@/services/analysis/performance-analyzer.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 import { ESLint } from 'eslint';
+import js from '@eslint/js';
 import ts from 'typescript';
-import * as path from 'path';
+
+const require = createRequire(import.meta.url);
+const tsPluginRaw = require('@typescript-eslint/eslint-plugin/use-at-your-own-risk/raw-plugin') as {
+  plugin: Record<string, unknown>;
+  parser: { parseForESLint: (source: string, options?: unknown) => unknown };
+  flatConfigs: { 'flat/recommended': ESLint.Options['baseConfig'] };
+};
 
 export interface CodeIssueInterface {
   file: string;
@@ -89,17 +98,15 @@ export class CodeAnalyzerService {
   private readonly performanceAnalyzer = Container.get(PerformanceAnalyzerService);
 
   public constructor() {
+    const tsRecommendedConfigs = tsPluginRaw.flatConfigs['flat/recommended'];
+    const baseConfig = [
+      js.configs.recommended,
+      ...(Array.isArray(tsRecommendedConfigs) ? tsRecommendedConfigs : [tsRecommendedConfigs]),
+    ];
     this.eslint = new ESLint({
-      overrideConfig: {
-        parser: '@typescript-eslint/parser',
-        plugins: ['@typescript-eslint'],
-        extends: [
-          'eslint:recommended',
-          'plugin:@typescript-eslint/recommended',
-        ],
-      },
+      baseConfig: baseConfig as ESLint.Options['baseConfig'],
       overrideConfigFile: null,
-    } as any);
+    });
   }
 
   public analyzeChanges = async (changes: ScmChangeInterface[]): Promise<CodeIssueInterface[]> => {
@@ -143,10 +150,6 @@ export class CodeAnalyzerService {
     const eslintResults = await this.eslint.lintText(content, { filePath });
     issues.push(...this.parseESLintResults(eslintResults));
 
-    // TypeScript анализ
-    const tsIssues = this.analyzeTypeScript(content, filePath);
-    issues.push(...tsIssues);
-
     return issues;
   };
 
@@ -162,34 +165,6 @@ export class CodeAnalyzerService {
         rule: message.ruleId || 'unknown',
       })),
     );
-  };
-
-  private analyzeTypeScript = (content: string, filePath: string): CodeIssueInterface[] => {
-    const issues: CodeIssueInterface[] = [];
-    const sourceFile = ts.createSourceFile(
-      filePath,
-      content,
-      ts.ScriptTarget.Latest,
-      true,
-    );
-
-    // Проверка на any тип
-    const checkForAny = (node: ts.Node): void => {
-      if (ts.isTypeReferenceNode(node) && node.typeName.getText() === 'any') {
-        issues.push({
-          file: filePath,
-          line: sourceFile.getLineAndCharacterOfPosition(node.pos).line + 1,
-          severity: 'warning',
-          message: 'Avoid using "any" type',
-          rule: 'no-explicit-any',
-          suggestion: 'Use specific types or unknown',
-        });
-      }
-      ts.forEachChild(node, checkForAny);
-    };
-
-    checkForAny(sourceFile);
-    return issues;
   };
 
   private extractLogicalChangeCandidates = (change: ScmChangeInterface): CodeIssueInterface[] => {

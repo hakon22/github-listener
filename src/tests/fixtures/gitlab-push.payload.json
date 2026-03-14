@@ -1,0 +1,25 @@
+{
+  "object_kind": "push",
+  "ref": "refs/heads/production",
+  "before": "172ff123e1bb582ea63de5bd8f7614e3dd1b89a5",
+  "after": "8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+  "user_name": "Aleksey",
+  "user_username": "hakon22",
+  "total_commits_count": 1,
+  "project": {
+    "id": 12345678,
+    "name": "github-listener",
+    "path_with_namespace": "hakon22/github-listener",
+    "web_url": "https://gitlab.com/hakon22/github-listener"
+  },
+  "commits": [
+    {
+      "id": "8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+      "message": "feat: улучшение логики анализа",
+      "url": "https://gitlab.com/hakon22/github-listener/-/commit/8bb768bc7d58",
+      "added": ["src/services/analysis/affected-files.service.ts"],
+      "modified": [".gitignore", "README.md", "src/controllers/github-webhook.controller.ts"],
+      "removed": []
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "action": "opened",
+  "repository": {
+    "id": 1178317321,
+    "node_id": "R_kgDORjuyCQ",
+    "name": "github-listener",
+    "full_name": "hakon22/github-listener",
+    "private": false,
+    "owner": {
+      "login": "hakon22",
+      "id": 111744315,
+      "node_id": "U_kgDOBqkVOw",
+      "type": "User"
+    },
+    "html_url": "https://github.com/hakon22/github-listener",
+    "default_branch": "main"
+  },
+  "pull_request": {
+    "number": 42,
+    "title": "feat: add new analysis flow",
+    "html_url": "https://github.com/hakon22/github-listener/pull/42",
+    "head": {
+      "sha": "8bb768bc7d58f06aa74ee5047ddc3fbb5cb7c9b0",
+      "ref": "feature/analysis"
+    },
+    "base": {
+      "sha": "172ff123e1bb582ea63de5bd8f7614e3dd1b89a5",
+      "ref": "main"
+    }
+  },
+  "sender": {
+    "login": "hakon22",
+    "id": 111744315,
+    "type": "User"
+  }
+}

@@ -35,7 +35,8 @@ export class LoggerService {
 
   public constructor() {
     this.colorizer.addColors(this.colors);
-    this.transports = process.env.DB === 'LOCAL' || process.env.CRON
+    const useConsole = process.env.DB === 'LOCAL' || process.env.CRON || process.env.NODE_ENV !== 'production';
+    this.transports = useConsole
       ? [new winston.transports.Console()]
       : [// Логи в файл с ежедневной ротацией
         new DailyRotateFile({

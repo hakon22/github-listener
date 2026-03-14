@@ -1,3 +1,4 @@
+import * as path from 'path';
 import { Container, Singleton } from 'typescript-ioc';
 
 import { AIService } from '@/services/analysis/ai.service';
@@ -57,6 +58,7 @@ export class ScmReviewService {
       summaryTitle,
       categorizedRecommendations,
       topIssues,
+      changes,
     );
 
     return {
@@ -111,6 +113,8 @@ export class ScmReviewService {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
+  private normalizePath = (filePath: string): string => path.normalize(filePath).replace(/\\/g, '/');
+
   private categorizeRecommendations = (
     recommendations: AICodeIssueRecommendation[],
   ): CategorizedRecommendationsInterface => ({
@@ -125,11 +129,34 @@ export class ScmReviewService {
     ),
   });
 
+  private static readonly SNIPPET_CONTEXT_LINES = 2;
+
+  private getCodeSnippet = (content: string, lineOneBased: number): string => {
+    const lines = content.split('\n');
+    const lineIndex = lineOneBased - 1;
+    const start = Math.max(0, lineIndex - ScmReviewService.SNIPPET_CONTEXT_LINES);
+    const end = Math.min(lines.length, lineIndex + ScmReviewService.SNIPPET_CONTEXT_LINES + 1);
+    const snippetLines = lines.slice(start, end);
+    return snippetLines
+      .map((line, index) => {
+        const currentLineNum = start + index + 1;
+        const marker = currentLineNum === lineOneBased ? ' →' : '  ';
+        return `${currentLineNum}${marker} ${line}`;
+      })
+      .join('\n');
+  };
+
   private buildAnalysisSummary = (
     summaryTitle: string,
     categorizedRecommendations: CategorizedRecommendationsInterface,
     topIssues: AICodeIssueRecommendation[],
+    changes: ScmChangeInterface[],
   ): string => {
+    const contentByFile = new Map<string, string>();
+    for (const change of changes) {
+      contentByFile.set(this.normalizePath(change.file), change.newContent);
+    }
+
     const issueLines = topIssues.map((recommendation, index) => {
       const location = `${recommendation.file}:${recommendation.line}`;
       const header = `${index + 1}. [${this.escapeHtml(recommendation.type)}] <code>${this.escapeHtml(location)}</code>`;
@@ -139,6 +166,15 @@ export class ScmReviewService {
       const suggestion = recommendation.suggestion ? this.escapeHtml(recommendation.suggestion) : '';
 
       const parts: string[] = [`${header} — ${description}`];
+
+      const content = contentByFile.get(this.normalizePath(recommendation.file));
+      if (content) {
+        const snippet = this.getCodeSnippet(content, recommendation.line);
+        if (snippet.trim()) {
+          parts.push(`<pre><code>${this.escapeHtml(snippet)}</code></pre>`);
+        }
+      }
+
       if (impact) {
         parts.push(`  Возможные последствия: ${impact}`);
       }

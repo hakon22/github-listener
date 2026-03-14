@@ -5,6 +5,8 @@ import { LoggerService } from '@/services/core/logger.service';
 import { TelegramService } from '@/services/notifications/telegram.service';
 
 export abstract class BaseService {
+  protected readonly TAG: string = 'BaseService';
+
   protected loggerService = Container.get(LoggerService);
 
   protected telegramService = Container.get(TelegramService);
@@ -16,19 +18,13 @@ export abstract class BaseService {
       } catch (error) {
         const errorInstance = error as Error;
 
-        this.loggerService.error('Unhandled error in deferred task', {
-          error: {
-            name: errorInstance?.name || String(error),
-            message: errorInstance?.message || String(error),
-            stack: errorInstance?.stack,
-          },
-        });
+        this.loggerService.error(this.TAG, 'Unhandled error in deferred task', errorInstance);
       }
     });
   };
 
   protected logWebhookProcessed = (providerName: 'GitHub' | 'GitLab', eventName: string, extras: Record<string, unknown>): void => {
-    this.loggerService.info(`${providerName} ${eventName} event processed and notification sent`, {
+    this.loggerService.info(this.TAG, `${providerName} ${eventName} event processed and notification sent`, {
       extras,
     });
   };
@@ -36,20 +32,14 @@ export abstract class BaseService {
   protected handleWebhookProcessingError = (providerName: 'GitHub' | 'GitLab', error: unknown, response: Response): Response => {
     const errorInstance = error as Error;
 
-    this.loggerService.error(`Error ocurred during ${providerName} webhook processing`, {
-      error: {
-        name: errorInstance?.name || String(error),
-        message: errorInstance?.message || String(error),
-        stack: errorInstance?.stack,
-      },
-    });
+    this.loggerService.error(this.TAG, `Error ocurred during ${providerName} webhook processing`, errorInstance);
 
     this.errorHandler(error, response);
     return response;
   };
 
   protected errorHandler = (e: any, res: Response, statusCode = 500) => {
-    this.loggerService.error(String(e));
+    this.loggerService.error(this.TAG, e);
 
     let error = `${e?.name}: ${e?.message}`;
 

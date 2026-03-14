@@ -3,29 +3,65 @@ import { Container, Singleton } from 'typescript-ioc';
 
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import { ScmChangeBuilderService } from '@/services/scm/scm-change-builder.service';
+import {
+  API_REQUEST_TIMEOUT_MS,
+  createFetchWithTimeout,
+  createRateLimiter,
+  DELAY_BETWEEN_REQUESTS_MS,
+} from '@/utils/api-request.utils';
 
 @Singleton
 export class GithubAgent {
   private readonly scmChangeBuilderService = Container.get(ScmChangeBuilderService);
 
+  private readonly requestDelay = createRateLimiter(DELAY_BETWEEN_REQUESTS_MS);
+
   private readonly octokit = new Octokit({
     auth: process.env.GITHUB_TOKEN,
     baseUrl: process.env.GITHUB_API_URL,
+    request: {
+      fetch: createFetchWithTimeout(API_REQUEST_TIMEOUT_MS),
+    },
   });
+
+  private static readonly COMPARE_RETRY_DELAY_MS = 2000;
 
   public getPushChanges = async (owner: string, repositoryName: string, beforeSha: string, afterSha: string, paths: string[]): Promise<ScmChangeInterface[]> => {
     if (!owner || !repositoryName) {
       throw new Error('Owner or repositoryName is not provided');
     }
 
-    const { data } = await this.octokit.repos.compareCommits({
+    const fetchCompare = () => this.octokit.repos.compareCommits({
       owner,
       repo: repositoryName,
       base: beforeSha,
       head: afterSha,
     });
 
+    await this.requestDelay();
+    let response: Awaited<ReturnType<typeof fetchCompare>>;
+    try {
+      response = await fetchCompare();
+    } catch (error) {
+      const err = error as { status?: number; response?: { status?: number } };
+      const status = err.status ?? err.response?.status;
+      if (typeof status === 'number' && status >= 500 && status < 600) {
+        await new Promise((resolve) => setTimeout(resolve, GithubAgent.COMPARE_RETRY_DELAY_MS));
+        response = await fetchCompare();
+      } else {
+        throw error;
+      }
+    }
+
+    const { data } = response;
     const files = data.files ?? [];
+
+    const addedPaths = new Set(
+      files.filter((file) => file.status === 'added' && file.filename).map((file) => file.filename!),
+    );
+    const removedPaths = new Set(
+      files.filter((file) => file.status === 'removed' && file.filename).map((file) => file.filename!),
+    );
 
     const diffByPath = new Map<string, string>();
     for (const file of files) {
@@ -37,8 +73,12 @@ export class GithubAgent {
 
     return this.scmChangeBuilderService.buildPushChanges(
       paths,
-      (filePath) => this.getFileContent(owner, repositoryName, filePath, beforeSha),
-      (filePath) => this.getFileContent(owner, repositoryName, filePath, afterSha),
+      (filePath) => addedPaths.has(filePath)
+        ? Promise.resolve('')
+        : this.getFileContent(owner, repositoryName, filePath, beforeSha),
+      (filePath) => removedPaths.has(filePath)
+        ? Promise.resolve('')
+        : this.getFileContent(owner, repositoryName, filePath, afterSha),
       diffByPath,
     );
   };
@@ -48,6 +88,7 @@ export class GithubAgent {
       throw new Error('Owner or repositoryName is not provided');
     }
 
+    await this.requestDelay();
     const { data: files } = await this.octokit.pulls.listFiles({
       owner,
       repo: repositoryName,
@@ -94,6 +135,7 @@ export class GithubAgent {
       throw new Error('Owner or repositoryName is not provided');
     }
 
+    await this.requestDelay();
     const { data: commit } = await this.octokit.repos.getCommit({
       owner,
       repo: repositoryName,
@@ -102,6 +144,7 @@ export class GithubAgent {
 
     const treeSha = commit.commit.tree.sha;
 
+    await this.requestDelay();
     const { data: tree } = await this.octokit.git.getTree({
       owner,
       repo: repositoryName,
@@ -148,6 +191,7 @@ export class GithubAgent {
     }
 
     try {
+      await this.requestDelay();
       const { data } = await this.octokit.repos.getContent({
         owner,
         repo: repositoryName,
