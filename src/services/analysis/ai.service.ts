@@ -103,6 +103,8 @@ interface TraceabilityPayloadItem {
 
 @Singleton
 export class AIService extends ModelBaseService {
+  protected readonly TAG = 'AIService';
+
   private readonly codeReviewPrompt: PromptTemplate;
 
   private readonly logicalDataLoadingPrompt: PromptTemplate;
@@ -142,16 +144,17 @@ export class AIService extends ModelBaseService {
     this.codeReviewPrompt = PromptTemplate.fromTemplate(`
       Ты — опытный ревьюер TypeScript/Node.js кода.
       
-      Тебе переданы:
-      - список проблем статического анализа (ESLint/TS/security/perf);
-      - отдельные логические кандидаты на потенциальные ошибки (изменения схем сущностей и сигнатур функций);
-      - несколько похожих по смыслу фрагментов кода из проекта.
+      Тебе переданы только критические кандидаты (error/security): проблемы статического анализа и логические кандидаты на ошибки в рантайме.
+      - список проблем (file, line, message, rule, suggestion);
+      - похожие по смыслу фрагменты кода из проекта.
       
-      Проблемы (JSON-массив объектов с полями как минимум "file", "line", "severity", "message", "rule", "suggestion"):
+      Проблемы (JSON-массив):
       {issues}
       
-      Похожие фрагменты кода (JSON-массив, каждый элемент содержит "file", "score", "snippet"):
+      Похожие фрагменты кода (JSON-массив, каждый элемент: "file", "score", "snippet"):
       {projectPatterns}
+      
+      ВАЖНО: Возвращай рекомендации только для тех проблем, которые гарантированно приведут к ошибке в рантайме, падению или уязвимости. Не включай quality, best_practice, стилистику — только type "security" или проблемы с реальным риском падения/некорректных данных.
       
       ОСОБЫЕ ПРАВИЛА ДЛЯ ЛОГИЧЕСКИХ ИЗМЕНЕНИЙ:
       - Если rule === "logical-entity-schema-change":
@@ -186,22 +189,21 @@ export class AIService extends ModelBaseService {
         - это проблема, найденная логическим анализом ИИ: код обращается к полям/связям результата запроса, которые, по смыслу кода запроса, не загружаются (TypeORM relations/join, Knex select/join, raw SQL, Prisma include/select и т.д.). В рантайме — undefined или ошибка.
         - Рекомендация: добавить недостающие поля/связи в выборку. Выдели это как критичную ошибку в "impact".
       
-      Для КАЖДОЙ входной проблемы верни ОДИН элемент массива JSON СТРОГО такого вида:
+      Для КАЖДОЙ входной проблемы верни ОДИН элемент массива JSON СТРОГО такого вида (только если проблема реально приведёт к ошибке в рантайме или уязвимости; иначе для этой проблемы верни пустой объект {{}} или не включай в массив):
       [
         {{
-          "type": "quality|security|performance|best_practice",
+          "type": "security" или "performance" (только если приведёт к падению/ошибке; не используй quality/best_practice),
           "message": "Краткое описание проблемы (1 предложение, по-русски, не более 160 символов)",
           "suggestion": "Краткая рекомендация, как исправить (1 предложение, по-русски, не более 160 символов)",
-          "impact": "К чему может привести в проде, если не исправить (1 предложение, по-русски, не более 160 символов)",
+          "impact": "К чему приведёт в проде: ошибка в рантайме, падение, уязвимость (1 предложение, по-русски, не более 160 символов)",
           "codeExample": "Короткий пример исправленного кода, если уместно"
         }}
       ]
       
       ТРЕБОВАНИЯ:
       - Пиши ТОЛЬКО по-русски.
-      - Не выдумывай детали, которых нет в коде.
-      - Будь особенно внимателен к проблемам с rule "logical-entity-schema-change", "logical-function-signature-change" и "logical-query-result-mismatch":
-        если виден потенциальный продакшн-риск, явно опиши его в поле "impact" и сделай "message"/"suggestion" максимально конкретными.
+      - Включай в массив только критические проблемы (ошибка в рантайме, падение, security). Не включай догадки, стилистику, quality, best_practice.
+      - Будь особенно внимателен к rule "logical-entity-schema-change", "logical-function-signature-change", "logical-query-result-mismatch": включай только если есть реальный риск падения или некорректных данных.
       - Не используй Markdown и текст вне JSON.
       - Выведи ТОЛЬКО JSON-массив без лишнего текста.
     `);
@@ -262,6 +264,7 @@ export class AIService extends ModelBaseService {
       
       Формат ответа — JSON-массив. Каждый элемент ОБЯЗАТЕЛЬНО содержит: file, line, message, sourceFile, sourceLine, propertyPath.
       sourceFile — файл, где объект загружается/создаётся (или откуда передаётся в вызове). sourceLine — строка в нём (1-based). propertyPath — цепочка свойств (например order.delivery.address).
+      КРИТИЧНО для поля line: указывай СТРОГО номер строки из propertyAccessEntries, где в коде обращаются к свойству (доступ к полю, .map с использованием свойства и т.п.). НЕ указывай строку с find/findOne, if (!...), закрывающими скобками или вызовом sendTelegramAdminMessage — иначе сниппет кода будет не по теме проблемы.
       Если не можешь указать sourceFile и propertyPath для проблемы — не включай её в массив.
       [
         {{ "file": "путь/файла_использования", "line": номер_строки, "message": "краткое описание по-русски", "sourceFile": "путь/файла_источника", "sourceLine": номер_строки_источника, "propertyPath": "цепочка.свойств" }}
@@ -274,7 +277,7 @@ export class AIService extends ModelBaseService {
       
       Тебе даны:
       - список git-коммитов (сообщения и затронутые файлы);
-      - список найденных проблем в коде (severity, type, message, impact, suggestion);
+      - список критических проблем в коде (только error/security: type, message, impact, suggestion);
       - список изменений по файлам (JSON-массив объектов с полями "file", "diff", "newContent").
         "diff" — unified diff (строки с + добавлены, с - удалены). "newContent" — полный текст новой версии файла для контекста.
       
@@ -308,6 +311,11 @@ export class AIService extends ModelBaseService {
       Без Markdown и списков — только простой текст. Пиши ТОЛЬКО по-русски.
     `);
 
+    /**
+     * ВАЖНО для unified-анализатора: мы нумеруем строки исходного файла сами,
+     * чтобы модель могла надёжно вернуть корректный номер строки.
+     */
+
     this.unifiedAnalysisPrompt = PromptTemplate.fromTemplate(`
       Ты — Senior-разработчик, проводишь код-ревью изменений в TypeScript/Node.js проекте.
       
@@ -315,19 +323,22 @@ export class AIService extends ModelBaseService {
       Изменения (JSON-массив объектов с полями "file", "newContent", "diff"):
       {changes}
       
-      Задача: найди проблемы в коде, которые могут привести к багам, уязвимостям или поломке в проде.
+      ВАЖНО: поле "newContent" уже содержит пронумерованные строки исходного файла в формате "N: код_строки", где N — номер строки, начиная с 1. Когда возвращаешь поле "line" в ответе — используй ИМЕННО этот номер N из префикса "N:". Не придумывай номера строк сам, всегда опирайся на префикс.
+      
+      Задача: найди только те проблемы, которые гарантированно приведут к ошибке в рантайме, падению или уязвимости. Не сообщай warning/info, стилистику, догадки.
       Проверь:
       - Безопасность: eval, небезопасные вызовы (execSync), XSS-риски (.innerHTML и т.п.).
-      - Производительность: тяжёлые операции в циклах, console.log в продакшн-коде.
-      - Загрузка данных: обращение к полям/связям объектов, которые не загружаются в запросе (relations, include, select). При этом: (1) если свойство в типе объявлено обязательным (без ?) — не сообщай проблему; (2) вложенные свойства (например relation.field), которые могут быть не загружены в БД, проверяй и при отсутствии загрузки — сообщай; (3) типы из node_modules не проверяй.
-      - Контракты: изменение схем сущностей или сигнатур функций без обновления вызывающего кода.
+      - Загрузка данных: обращение к полям/связям объектов, которые не загружаются в запросе (relations, include, select) — только если это приведёт к ошибке в рантайме. (1) Свойство в типе обязательное (без ?) — не сообщай. (2) Вложенные свойства (relation.field), не загруженные в БД — сообщай. (3) Типы из node_modules не проверяй.
+      - Контракты: изменение схем сущностей или сигнатур без обновления вызывающего кода — только если вызов сломается в рантайме.
       
-      Верни JSON-массив проблем СТРОГО в формате:
+      Цепочка вызовов для "line": если проблема — отсутствующая relation в findOne/find, то "line" должна указывать на строку, где используется именно РЕЗУЛЬТАТ ЭТОГО запроса (по цепочке вызовов). Например: findOne в методе A → A вызывает B(transaction) → в B обращаются к transaction.order.positions[].item.translations. Указывай строку в B (где реально произойдёт ошибка), а не похожий код в другом методе C, который получает order из параметра/другого источника. Одна и та же сущность может использоваться в разных методах — важен тот метод, куда передаётся результат данного find.
+      
+      Верни JSON-массив проблем СТРОГО в формате (только severity "error" — warning и info не используем):
       [
-        {{ "file": "путь/к/файлу", "line": number, "severity": "error"|"warning"|"info", "message": "описание", "rule": "краткий_идентификатор", "suggestion": "как исправить" }}
+        {{ "file": "путь/к/файлу", "line": number, "severity": "error", "message": "описание", "rule": "краткий_идентификатор", "suggestion": "как исправить" }}
       ]
-      Пиши message и suggestion по-русски. rule — латиницей (например security-eval, performance-console, data-loading-relation).
-      Если проблем нет — верни пустой массив [].
+      Пиши message и suggestion по-русски. rule — латиницей (например security-eval, data-loading-relation).
+      Если критических проблем нет — верни пустой массив [].
       Выведи ТОЛЬКО JSON-массив, без markdown и лишнего текста.
     `);
   }
@@ -378,6 +389,12 @@ export class AIService extends ModelBaseService {
       issues: JSON.stringify(issues),
       projectPatterns: JSON.stringify(projectPatterns),
     });
+
+    this.loggerService.debug(
+      this.TAG,
+      'AI codeReviewPrompt raw response',
+      typeof result === 'string' ? result.slice(0, 2000) : result,
+    );
 
     let partials: AIPartialRecommendation[] = [];
 
@@ -431,7 +448,11 @@ export class AIService extends ModelBaseService {
       if (totalChars >= AIService.UNIFIED_ANALYSIS_MAX_CHARS) {
         break;
       }
-      const newContent = (change.newContent ?? '').slice(0, maxPerFile);
+      const originalContent = change.newContent ?? '';
+      if (!originalContent.trim()) {
+        continue;
+      }
+      const newContent = this.buildNumberedContent(originalContent, maxPerFile);
       const diffMaxLen = Math.max(0, maxPerFile - newContent.length);
       const diff = (change.diff ?? '').slice(0, Math.min(2000, diffMaxLen));
       const slice = newContent.length + diff.length;
@@ -461,13 +482,19 @@ export class AIService extends ModelBaseService {
       changes: JSON.stringify(payload),
     });
 
+    this.loggerService.debug(
+      this.TAG,
+      'AI unifiedAnalysisPrompt raw response',
+      typeof result === 'string' ? result.slice(0, 2000) : result,
+    );
+
     try {
       const jsonText = this.extractJsonPayload(result);
       const parsed = JSON.parse(jsonText) as unknown;
       if (!Array.isArray(parsed)) {
         return [];
       }
-      return parsed
+      const mapped = parsed
         .filter(
           (item): item is { file: string; line: unknown; severity: string; message: string; rule?: string; suggestion?: string } =>
             typeof item === 'object' &&
@@ -479,12 +506,19 @@ export class AIService extends ModelBaseService {
         )
         .map((item) => ({
           file: item.file,
-          line: typeof item.line === 'number' ? item.line : 1,
+          line: this.normalizeLineNumberOneBased(item.line),
           severity: (['error', 'warning', 'info'].includes(item.severity) ? item.severity : 'info') as CodeIssueInterface['severity'],
           message: item.message,
           rule: typeof item.rule === 'string' ? item.rule : 'unified-ai',
           suggestion: typeof item.suggestion === 'string' ? item.suggestion : undefined,
         }));
+
+      this.loggerService.debug(
+        this.TAG,
+        'AI unifiedAnalysisIssues mapped',
+        mapped.slice(0, 20),
+      );
+      return mapped.filter((issue) => issue.severity === 'error');
     } catch {
       return [];
     }
@@ -712,6 +746,12 @@ export class AIService extends ModelBaseService {
       traceability: JSON.stringify(traceabilityPayload),
     });
 
+    this.loggerService.debug(
+      this.TAG,
+      'AI logicalDataLoadingPrompt raw response',
+      typeof result === 'string' ? result.slice(0, 2000) : result,
+    );
+
     const sourcePathsSet = new Set(
       sourceFilesPayload.map((payload) => path.normalize(payload.file).replace(/\\/g, '/')),
     );
@@ -754,13 +794,23 @@ export class AIService extends ModelBaseService {
             const sourceNorm = path.normalize(item.sourceFile).replace(/\\/g, '/');
             return allKnownPathsSet.has(sourceNorm) && (usagePathsSet.has(usageNorm) || sourcePathsSet.has(usageNorm));
           });
+
+        this.loggerService.debug(
+          this.TAG,
+          'AI logicalDataLoadingPrompt parsed items',
+          items.slice(0, 20),
+        );
       }
     } catch {
       return [];
     }
 
     const contentByFile = this.buildFileContentMap(sourceFilesPayload, usageFilesPayload);
-    let filteredItems = items.filter((item) =>
+    const itemsWithCorrectLine = items.map((item) => ({
+      ...item,
+      line: this.resolveLineFromTraceability(traceabilityPayload, item.file, item.propertyPath, item.line),
+    }));
+    let filteredItems = itemsWithCorrectLine.filter((item) =>
       this.isLineWithPropertyAccess(item.file, item.line, contentByFile),
     );
     // Ложное срабатывание: связь подгружается в любом из связанных файлов (в т.ч. в верхней/вызывающей функции).
@@ -797,7 +847,7 @@ export class AIService extends ModelBaseService {
       uniqueIssues.push(issue);
     }
 
-    return uniqueIssues;
+    return uniqueIssues.filter((issue) => issue.severity === 'error');
   };
 
   /**
@@ -1029,6 +1079,38 @@ export class AIService extends ModelBaseService {
     return hasFind;
   };
 
+  /**
+   * Подставляет номер строки из traceability (AST), чтобы сниппет показывал место обращения к свойству,
+   * а не произвольную строку из ответа LLM.
+   */
+  private resolveLineFromTraceability = (
+    traceabilityPayload: TraceabilityPayloadItem[],
+    usageFile: string,
+    propertyPath: string,
+    fallbackLine: number,
+  ): number => {
+    const normalizedUsage = path.normalize(usageFile).replace(/\\/g, '/');
+    const propertyPathTrimmed = propertyPath.trim();
+    const lastSegment = propertyPathTrimmed.split('.').filter(Boolean).pop() ?? '';
+
+    for (const item of traceabilityPayload) {
+      const normalizedDefinition = path.normalize(item.definitionFile).replace(/\\/g, '/');
+      if (normalizedDefinition !== normalizedUsage) {
+        continue;
+      }
+      for (const entry of item.propertyAccessEntries) {
+        if (entry.propertyPath === propertyPathTrimmed) {
+          return entry.line;
+        }
+        const entryLast = entry.propertyPath.split('.').filter(Boolean).pop();
+        if (lastSegment && entryLast === lastSegment) {
+          return entry.line;
+        }
+      }
+    }
+    return fallbackLine;
+  };
+
   /** Проверяет, что в указанной строке файла есть обращение к свойству (например obj.prop или obj?.prop). */
   private isLineWithPropertyAccess = (
     filePath: string,
@@ -1046,6 +1128,27 @@ export class AIService extends ModelBaseService {
     }
     const line = lines[lineIndex];
     return AIService.PROPERTY_ACCESS_LINE_PATTERN.test(line);
+  };
+
+  private buildNumberedContent = (content: string, maxCharsPerFile: number): string => {
+    const lines = content.split('\n');
+    const numberedLines: string[] = [];
+    let totalLength = 0;
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const lineNumber = index + 1;
+      const numberedLine = `${lineNumber}: ${lines[index]}`;
+      const nextLength = totalLength + numberedLine.length + 1;
+
+      if (nextLength > maxCharsPerFile) {
+        break;
+      }
+
+      numberedLines.push(numberedLine);
+      totalLength = nextLength;
+    }
+
+    return numberedLines.join('\n');
   };
 
   /**

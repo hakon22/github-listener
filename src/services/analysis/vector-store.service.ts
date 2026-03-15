@@ -18,13 +18,13 @@ export class VectorStoreService extends ModelBaseService {
 
   private vectors: CodeVectorEntry[] = [];
 
-  /** timestamp последнего запроса к Mistral (ms) */
+  /** timestamp последнего запроса к OpenAI (ms) */
   private lastEmbeddingCallAt = 0;
 
   private readonly EMBEDDING_RATE_LIMIT_MS = 1000;
 
   /**
-   * Глобальный (по процессу) rate-limit для вызовов Mistral embeddings:
+   * Глобальный (по процессу) rate-limit для вызовов OpenAI embeddings:
    * не более одного HTTP-запроса в секунду.
    */
   private withEmbeddingRateLimit = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -55,8 +55,16 @@ export class VectorStoreService extends ModelBaseService {
 
   /**
    * Индексация кода в MR: каждая новая версия файла превращается в вектор.
+   * Требуется ответ API в формате OpenAI: { data: [ { embedding: number[] } ] }.
+   * При несовместимом OPENAI_BASE_URL задайте VECTOR_EMBEDDINGS_ENABLED=false.
    */
   public indexMergeRequestChanges = async (changes: ScmChangeInterface[]): Promise<void> => {
+    if (process.env.VECTOR_EMBEDDINGS_ENABLED === 'false') {
+      this.vectors = [];
+      this.loggerService.debug(this.TAG, 'Vector embeddings disabled by VECTOR_EMBEDDINGS_ENABLED');
+      return;
+    }
+
     if (!changes.length) {
       this.vectors = [];
       this.loggerService.debug(this.TAG, 'indexMergeRequestChanges: no changes, clearing vectors');
@@ -70,14 +78,16 @@ export class VectorStoreService extends ModelBaseService {
     const items: { file: string; content: string; }[] = [];
 
     for (const change of changes) {
-      const normalized = this.normalizeContent(change.newContent);
+      const normalized = this.normalizeContent(change.newContent ?? '');
       const chunks = this.chunkContent(normalized);
 
       for (const chunk of chunks) {
-        items.push({
-          file: change.file,
-          content: chunk,
-        });
+        if (chunk.length > 0) {
+          items.push({
+            file: change.file,
+            content: chunk,
+          });
+        }
       }
     }
 
@@ -89,18 +99,31 @@ export class VectorStoreService extends ModelBaseService {
     try {
       const embeddingsModel = await this.getEmbeddings();
 
-      // Mistral ограничивает общее число токенов в одном запросе и частоту запросов,
+      // OpenAI ограничивает общее число токенов в одном запросе и частоту запросов,
       // поэтому эмбеддим документы батчами и с rate-limit (не более 1 запроса в секунду).
       const BATCH_SIZE = 8;
       const vectors: CodeVectorEntry[] = [];
 
       for (let i = 0; i < items.length; i += BATCH_SIZE) {
         const batchItems = items.slice(i, i + BATCH_SIZE);
+        const texts = batchItems.map((item) => item.content);
+
         const batchEmbeddings = await this.withEmbeddingRateLimit(() =>
-          embeddingsModel.embedDocuments(batchItems.map(({ content }) => content)),
+          embeddingsModel.embedDocuments(texts),
         );
 
+        if (!Array.isArray(batchEmbeddings) || batchEmbeddings.length !== batchItems.length) {
+          this.loggerService.warn(
+            this.TAG,
+            `Embedding API returned unexpected format: expected array of length ${batchItems.length}, got ${Array.isArray(batchEmbeddings) ? batchEmbeddings.length : 'non-array'}. Skipping batch.`,
+          );
+          continue;
+        }
+
         batchEmbeddings.forEach((embedding: number[], index: number) => {
+          if (!Array.isArray(embedding) || embedding.length === 0) {
+            return;
+          }
           const item = batchItems[index];
           vectors.push({
             file: item.file,
@@ -114,10 +137,19 @@ export class VectorStoreService extends ModelBaseService {
       this.loggerService.info(this.TAG, `Embeddings built successfully: ${vectors.length} vectors`);
     } catch (error) {
       const errorInstance = error as Error;
-      this.loggerService.error(this.TAG, 'Failed to build embeddings for GitLab changes', errorInstance);
-
-      // В случае ошибок Mistral просто отключаем векторный поиск для этого пуша,
-      // чтобы не ломать весь пайплайн анализа.
+      const isFormatError = /reading '0'|\.data\[0\]|data\.embedding/i.test(errorInstance.message ?? '');
+      this.loggerService.error(
+        this.TAG,
+        'Failed to build embeddings for changes',
+        errorInstance,
+      );
+      if (isFormatError) {
+        this.loggerService.warn(
+          this.TAG,
+          'Embedding API must return OpenAI-compatible format: { data: [ { embedding: number[] } ] }. '
+          + 'If using a custom OPENAI_BASE_URL that does not support this, set VECTOR_EMBEDDINGS_ENABLED=false to disable vector search.',
+        );
+      }
       this.vectors = [];
     }
   };
@@ -126,8 +158,8 @@ export class VectorStoreService extends ModelBaseService {
    * Находит наиболее похожие по смыслу файлы относительно запроса.
    * Возвращает путь, контент и similarity score.
    */
-  public findSimilarCode = async (query: string, limit = 5): Promise<Array<CodeVectorEntry & { score: number; }>> => {
-    if (!query.trim() || !this.vectors.length) {
+  public findSimilarCode = async (query: string, limit = 5): Promise<(CodeVectorEntry & { score: number; })[]> => {
+    if (process.env.VECTOR_EMBEDDINGS_ENABLED === 'false' || !query.trim() || !this.vectors.length) {
       return [];
     }
 
@@ -147,9 +179,9 @@ export class VectorStoreService extends ModelBaseService {
         .slice(0, limit);
     } catch (error) {
       const errorInstance = error as Error;
-      this.loggerService.error(this.TAG, 'Failed to compute embedding for GitLab query', errorInstance);
+      this.loggerService.error(this.TAG, 'Failed to compute embedding for OpenAI query', errorInstance);
 
-      // Если Mistral недоступен, просто не используем поиск похожего кода.
+      // Если OpenAI недоступен, просто не используем поиск похожего кода.
       return [];
     }
   };

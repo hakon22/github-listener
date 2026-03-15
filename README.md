@@ -8,7 +8,7 @@
 - анализирует изменённые файлы и затронутые ими файлы (impact analysis);
 - для каждого файла: ESLint, TypeScript, проверки безопасности и производительности, эвристики изменений сигнатур;
 - обогащает результаты через LLM (OpenAI);
-- пишет краткое HTML‑резюме и топ проблем в Telegram.
+- пишет краткое HTML‑резюме и топ проблем в Telegram (в блоке сниппета над кодом — только имя файла, без пути).
 
 ---
 
@@ -99,6 +99,7 @@ const baseConfig = [
   - `IMPACT_ANALYSIS_ENABLED` — при значении `false` отключается поиск и анализ затронутых файлов (по умолчанию включено).
   - `LOGICAL_CHANGE_EXTRACTION_ENABLED` — при значении `false` отключается извлечение и проверка логических изменений (сигнатуры, загрузка данных через ИИ) (по умолчанию включено).
   - `USE_UNIFIED_AI_ANALYSIS` — при значении `true` для поиска проблем загрузки данных используется единый унифицированный AI‑анализ вместо отдельного вызова.
+  - `VECTOR_EMBEDDINGS_ENABLED` — при значении `false` отключается индексация изменений в эмбеддинги и семантический поиск по коду. Используйте, если эндпоинт эмбеддингов (OPENAI_BASE_URL) возвращает ответ не в формате OpenAI (`{ data: [ { embedding: number[] } ] }`).
 - **Прочее**
   - `APP_NAME` — имя приложения в логах и уведомлениях об ошибках (по умолчанию `app`).
 - **AI‑модели (через LangChain)**
@@ -115,11 +116,13 @@ const baseConfig = [
 
 - `npm run build` — компиляция TypeScript в `dist` (tsc + tsc-alias).
 - `npm run start:app:dev` — запуск сервиса в dev‑режиме (`NODE_ENV=development`, `tsx src/main.ts`).
-- `npm run start:app:prod` — запуск собранного сервиса (production, `node dist/main.js`). Перед запуском выполните `npm run build`.
+- `npm run start:app:prod` — запуск собранного сервиса (production, `node dist/main.js`). Перед запуском выполните `npm run build` (сборка в `dist`).
 - `npm run start:app:docker:dev` — запуск внутри контейнера в dev‑режиме (`IS_DOCKER=TRUE`, `NODE_ENV=development`).
 - `npm run start:app:docker:prod` — запуск внутри контейнера в production‑режиме (`IS_DOCKER=TRUE`, `NODE_ENV=production`).
 - `npm run lint` — проверка кода ESLint по `src`; автоисправление: `npm run lint -- --fix`.
 - `npm run test` — запуск тестов Jest.
+
+**Makefile** (из корня репозитория): `make install` — установка зависимостей, `make test` — тесты, `make start-local` — запуск в dev‑режиме.
 
 ---
 
@@ -131,6 +134,12 @@ const baseConfig = [
 npm ci
 ```
 
+Или через Makefile (из корня репозитория):
+
+```bash
+make install
+```
+
 2. Настроить `.env` (минимум: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GITLAB_TOKEN` и/или `GITHUB_TOKEN`, `GITHUB_SECRET`).
 
 3. Запустить в режиме разработки:
@@ -139,7 +148,13 @@ npm ci
 npm run start:app:dev
 ```
 
-Сервис поднимет HTTP‑сервер на `http://localhost:3013`.
+Или:
+
+```bash
+make start-local
+```
+
+Сервис поднимет HTTP‑сервер на `http://localhost:3013`. Тесты: `make test` или `npm run test`.
 
 ---
 

@@ -48,14 +48,27 @@ export abstract class BaseService {
     }
 
     if (e instanceof Error && e.stack && process.env.TELEGRAM_CHAT_ID && process.env.NODE_ENV === 'production') {
+      const fileLabel = this.getFileLabelFromStack(e.stack);
       const message = [
         `Ошибка на сервере <b>${process.env.APP_NAME}</b>:`,
-        `<pre><code class="language-typescript">${e.stack}</code></pre>`,
+        `<pre><code class="language-${fileLabel}">${e.stack}</code></pre>`,
       ];
 
       this.defer(() => this.telegramService.sendAdminMessage(message, { parse_mode: 'HTML' }));
     }
 
     res.status(statusCode).json({ error });
+  };
+
+  /** Извлекает путь или имя файла из stack trace для подписи к блоку кода в Telegram. */
+  private getFileLabelFromStack = (stack: string): string => {
+    const match = stack.match(/^\s*at\s+(?:.*?\s+)?\(?(.+?):\d+:\d+\)?$/m)
+      ?? stack.match(/^\s*at\s+(.+?):\d+:\d+$/m);
+    if (!match?.[1]) {
+      return 'stack';
+    }
+    const pathPart = match[1].trim().replace(/^file:\/\//, '');
+    const fileName = pathPart.includes('/') ? pathPart.split('/').pop() : pathPart.split('\\').pop();
+    return (fileName ?? pathPart).replace(/\s+/g, '-');
   };
 }

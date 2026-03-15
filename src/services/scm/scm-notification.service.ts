@@ -43,7 +43,7 @@ export class ScmNotificationService {
 
     if (params.processedFilesCount !== undefined && params.processedFilesCount > 0) {
       textLines.push(`Обработано моделью: <b>${params.processedFilesCount}</b> файлов`);
-      if (params.processedFilePaths && params.processedFilePaths.length < 10) {
+      if (params.processedFilePaths && params.processedFilePaths.length < 20) {
         const escapedPaths = params.processedFilePaths.map((filePath) => `<code>${filePath.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;')}</code>`);
         textLines.push(escapedPaths.join('\n'));
       }
@@ -76,7 +76,7 @@ export class ScmNotificationService {
 
     if (params.processedFilesCount !== undefined && params.processedFilesCount > 0) {
       textLines.push('', `Обработано моделью: <b>${params.processedFilesCount}</b> файлов`);
-      if (params.processedFilePaths && params.processedFilePaths.length < 10) {
+      if (params.processedFilePaths && params.processedFilePaths.length < 20) {
         const escapedPaths = params.processedFilePaths.map((filePath) => `<code>${filePath.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;')}</code>`);
         textLines.push(escapedPaths.join('\n'));
       }

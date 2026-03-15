@@ -72,7 +72,7 @@ export class ScmPushAnalysisService {
         }
       }
 
-      // Фильтрация по типу файла (только .md) выполняется в ScmReviewService — единая точка входа.
+      // Фильтрация неанализируемых файлов (.md, package-lock.json) — ScmReviewService.isExcludedFromAnalysis.
       const affectedInput = driver.getAffectedPathsInput();
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
@@ -86,9 +86,18 @@ export class ScmPushAnalysisService {
 
       const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
       const analyzableChanges = mergedChanges.filter(
-        (change) => !ScmReviewService.isMarkdownFile(change.file),
+        (change) => !ScmReviewService.isExcludedFromAnalysis(change.file),
       );
-      const processedFilePaths = analyzableChanges.map((change) => change.file);
+
+      // Для детализации показываем только файлы, которые не были изменены в коммите,
+      // а были дополнительно загружены моделью по связям (impact analysis).
+      const normalizePath = (filePath: string): string => filePath.replace(/\\/g, '/');
+      const changedFilePathSet = new Set(
+        changedPaths.map((filePath) => normalizePath(filePath)),
+      );
+      const processedFilePaths = analyzableChanges
+        .map((change) => normalizePath(change.file))
+        .filter((filePath) => !changedFilePathSet.has(filePath));
 
       this.loggerService.info(this.TAG, 'Push analysis completed successfully');
 

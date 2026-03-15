@@ -19,18 +19,18 @@ export interface ScmFileChangeCommitInterface {
   removed?: string[];
 }
 
-interface CategorizedRecommendationsInterface {
-  criticalRecommendations: AICodeIssueRecommendation[];
-  warningRecommendations: AICodeIssueRecommendation[];
-  infoRecommendations: AICodeIssueRecommendation[];
-}
-
 @Singleton
 export class ScmReviewService {
   private static readonly TOP_ISSUES_LIMIT = 3;
 
   public static isMarkdownFile = (filePath: string): boolean =>
     filePath.toLowerCase().replace(/\\/g, '/').endsWith('.md');
+
+  /** Файлы, которые не отправляются в анализ модели (lock-файлы, markdown и т.д.). */
+  public static isExcludedFromAnalysis = (filePath: string): boolean => {
+    const normalized = filePath.toLowerCase().replace(/\\/g, '/');
+    return normalized.endsWith('.md') || normalized.endsWith('package-lock.json');
+  };
 
   private readonly analyzerService = Container.get(CodeAnalyzerService);
 
@@ -44,14 +44,10 @@ export class ScmReviewService {
     summaryTitle: string,
     options?: { getFileContent?: GetFileContentFn; getSourceFilePaths?: () => Promise<string[]>; },
   ): Promise<{ analysisSummary: string; humanSummary: string; }> => {
-    const analyzableChanges = changes.filter((change) => !ScmReviewService.isMarkdownFile(change.file));
+    const analyzableChanges = changes.filter((change) => !ScmReviewService.isExcludedFromAnalysis(change.file));
     const recommendations = await this.getRecommendationsForChanges(analyzableChanges, options);
-    const categorizedRecommendations = this.categorizeRecommendations(recommendations);
-
-    const topIssues = [
-      ...categorizedRecommendations.criticalRecommendations,
-      ...categorizedRecommendations.warningRecommendations,
-    ].slice(0, ScmReviewService.TOP_ISSUES_LIMIT);
+    const criticalRecommendations = this.getCriticalRecommendations(recommendations);
+    const topIssues = criticalRecommendations.slice(0, ScmReviewService.TOP_ISSUES_LIMIT);
 
     const humanSummary = await this.aiService.summarizePush(
       commits,
@@ -61,7 +57,7 @@ export class ScmReviewService {
 
     const analysisSummary = this.buildAnalysisSummary(
       summaryTitle,
-      categorizedRecommendations,
+      criticalRecommendations.length,
       topIssues,
       analyzableChanges,
     );
@@ -76,15 +72,18 @@ export class ScmReviewService {
     changes: ScmChangeInterface[],
     options?: LogicalDataLoadingOptions | GetFileContentFn,
   ): Promise<AICodeIssueRecommendation[]> => {
-    const analyzableChanges = changes.filter((change) => !ScmReviewService.isMarkdownFile(change.file));
+    const analyzableChanges = changes.filter((change) => !ScmReviewService.isExcludedFromAnalysis(change.file));
     await this.vectorStoreService.indexMergeRequestChanges(analyzableChanges);
 
     const analysis = await this.analyzerService.analyzeChanges(analyzableChanges);
     const logicalDataIssues = process.env.USE_UNIFIED_AI_ANALYSIS === 'true'
       ? await this.aiService.getUnifiedAnalysisIssues(analyzableChanges)
       : await this.aiService.getLogicalDataLoadingIssues(analyzableChanges, options);
-    const allIssues = [...analysis, ...logicalDataIssues];
-    return this.aiService.getRecommendations(allIssues);
+    const allIssues = [...analysis, ...logicalDataIssues].filter(
+      (issue) => issue.severity === 'error',
+    );
+    const recommendations = await this.aiService.getRecommendations(allIssues);
+    return this.getCriticalRecommendations(recommendations);
   };
 
   public buildAnalysisErrorSummary = (error: unknown): string => {
@@ -126,19 +125,13 @@ export class ScmReviewService {
 
   private normalizePath = (filePath: string): string => path.normalize(filePath).replace(/\\/g, '/');
 
-  private categorizeRecommendations = (
+  /** Только критические (error/security) — приводят к ошибке в рантайме; warning и info из проекта убраны. */
+  private getCriticalRecommendations = (
     recommendations: AICodeIssueRecommendation[],
-  ): CategorizedRecommendationsInterface => ({
-    criticalRecommendations: recommendations.filter(
-      (recommendation) => recommendation.severity === 'error' || recommendation.type === 'security',
-    ),
-    warningRecommendations: recommendations.filter(
-      (recommendation) => recommendation.severity === 'warning',
-    ),
-    infoRecommendations: recommendations.filter(
-      (recommendation) => recommendation.severity === 'info',
-    ),
-  });
+  ): AICodeIssueRecommendation[] => recommendations.filter(
+    (recommendation) =>
+      recommendation.severity === 'error' || recommendation.type === 'security',
+  );
 
   private static readonly SNIPPET_CONTEXT_LINES = 2;
 
@@ -149,27 +142,94 @@ export class ScmReviewService {
     const end = Math.min(lines.length, lineIndex + ScmReviewService.SNIPPET_CONTEXT_LINES + 1);
     const snippetLines = lines.slice(start, end);
     return snippetLines
-      .map((line, index) => {
+      .map((snippetLine, index) => {
         const currentLineNum = start + index + 1;
         const marker = currentLineNum === lineOneBased ? ' →' : '  ';
-        return `${currentLineNum}${marker} ${line}`;
+        return `${currentLineNum}${marker} ${snippetLine}`;
       })
       .join('\n');
   };
 
+  /**
+   * Для проблем загрузки данных сниппет должен показывать строку, где обращаются к свойству,
+   * а не find/if/закрывающие скобки. Работает и для logical-query-result-mismatch, и для unified-ai.
+   */
+  private getSnippetLineForIssue = (
+    content: string,
+    recommendation: AICodeIssueRecommendation,
+  ): number => {
+    const reportedLine = recommendation.line;
+    const propertySegment = this.extractPropertySegmentFromMessage(recommendation.message);
+    if (!propertySegment) {
+      return reportedLine;
+    }
+    const lines = content.split('\n');
+    const reportedIndex = reportedLine - 1;
+    const snippetAtReported = this.getCodeSnippet(content, reportedLine);
+    if (snippetAtReported.includes(propertySegment)) {
+      return reportedLine;
+    }
+    const escaped = this.escapeRegex(propertySegment);
+    const segmentPattern = new RegExp(
+      `\\.${escaped}(?:\\.|\\b)|['\"]${escaped}['\"]`,
+    );
+    let bestLine = reportedLine;
+    let bestDistance = lines.length;
+    for (let index = 0; index < lines.length; index += 1) {
+      if (segmentPattern.test(lines[index])) {
+        const distance = Math.abs(index - reportedIndex);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestLine = index + 1;
+        }
+      }
+    }
+    return bestLine;
+  };
+
+  private escapeRegex = (string: string): string =>
+    string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  private extractPropertySegmentFromMessage = (message: string): string | null => {
+    const patterns: RegExp[] = [
+      /(?:Свойство|свойство)[:\s]*["']?([^"'\s\]]+)["']?/i,
+      /Поле\s+["']([^"']+)["']/i,
+      /['"]([a-zA-Z0-9_.]+\.[a-zA-Z0-9_.]+(?:\.[a-zA-Z0-9_.]+)*)['"].*relations/i,
+      /relations.*['"]([a-zA-Z0-9_.]+)['"]/i,
+      /(?:добавьте|в массив relations).*['"]([a-zA-Z0-9_.]+)['"]/i,
+    ];
+    for (const pattern of patterns) {
+      const match = message.match(pattern);
+      const path = match?.[1]?.trim();
+      if (path) {
+        const lastSegment = path.split('.').filter(Boolean).pop();
+        return lastSegment ?? path;
+      }
+    }
+    return null;
+  };
+
   private buildAnalysisSummary = (
     summaryTitle: string,
-    categorizedRecommendations: CategorizedRecommendationsInterface,
+    criticalCount: number,
     topIssues: AICodeIssueRecommendation[],
     changes: ScmChangeInterface[],
   ): string => {
+    if (criticalCount === 0 && topIssues.length === 0) {
+      return '';
+    }
+
     const contentByFile = new Map<string, string>();
     for (const change of changes) {
       contentByFile.set(this.normalizePath(change.file), change.newContent);
     }
 
     const issueLines = topIssues.map((recommendation, index) => {
-      const location = `${recommendation.file}:${recommendation.line}`;
+      const content = contentByFile.get(this.normalizePath(recommendation.file));
+      const snippetLine = content
+        ? this.getSnippetLineForIssue(content, recommendation)
+        : recommendation.line;
+      const location = `${recommendation.file}:${snippetLine}`;
       const header = `${index + 1}. [${this.escapeHtml(recommendation.type)}] <code>${this.escapeHtml(location)}</code>`;
 
       const description = this.escapeHtml(recommendation.message);
@@ -178,11 +238,11 @@ export class ScmReviewService {
 
       const parts: string[] = [`${header} — ${description}`];
 
-      const content = contentByFile.get(this.normalizePath(recommendation.file));
       if (content) {
-        const snippet = this.getCodeSnippet(content, recommendation.line);
+        const snippet = this.getCodeSnippet(content, snippetLine);
         if (snippet.trim()) {
-          parts.push(`<pre><code>${this.escapeHtml(snippet)}</code></pre>`);
+          const fileLabel = this.escapeHtml(path.basename(recommendation.file)).replace(/\s+/g, '_');
+          parts.push(`<pre><code class="language-${fileLabel}">${this.escapeHtml(snippet)}</code></pre>`);
         }
       }
 
@@ -199,7 +259,7 @@ export class ScmReviewService {
     const summaryLines: string[] = [
       '',
       summaryTitle,
-      `Критические: <b>${categorizedRecommendations.criticalRecommendations.length}</b>, предупреждения: <b>${categorizedRecommendations.warningRecommendations.length}</b>, info: <b>${categorizedRecommendations.infoRecommendations.length}</b>.`,
+      `Критические: <b>${criticalCount}</b>.`,
     ];
 
     if (issueLines.length) {

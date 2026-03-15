@@ -103,6 +103,7 @@ export class CodeAnalyzerService {
     });
   }
 
+  /** Собираем только error — warning и info в проекте не используются. */
   public analyzeChanges = async (changes: ScmChangeInterface[]): Promise<CodeIssueInterface[]> => {
     const issues: CodeIssueInterface[] = [];
 
@@ -116,7 +117,7 @@ export class CodeAnalyzerService {
       }
     }
 
-    return issues;
+    return issues.filter((issue) => issue.severity === 'error');
   };
 
   public analyzeFile = async (filePath: string, content: string): Promise<CodeIssueInterface[]> => {
@@ -135,9 +136,10 @@ export class CodeAnalyzerService {
       return issues;
     }
 
-    // ESLint анализ
+    // ESLint анализ — оставляем только error, warning/info не собираем.
     const eslintResults = await this.eslint.lintText(content, { filePath });
-    issues.push(...this.parseESLintResults(eslintResults));
+    const parsed = this.parseESLintResults(eslintResults).filter((issue) => issue.severity === 'error');
+    issues.push(...parsed);
 
     return issues;
   };

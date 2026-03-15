@@ -192,8 +192,16 @@ Type: ${recommendation.type}
 Suggestion:
 ${recommendation.suggestion ?? ''}
 
-${recommendation.codeExample ? `Fixed example:\n\`\`\`typescript\n${recommendation.codeExample}\n\`\`\`` : ''}`;
+${recommendation.codeExample ? `Fixed example:\n\`\`\`${recommendation.file}\n${this.stripCodeFenceFromExample(recommendation.codeExample)}\n\`\`\`` : ''}`;
   }
+
+  /** Убирает ведущий markdown-fence (```typescript, ```javascript или ```) из примера кода от модели. */
+  private stripCodeFenceFromExample = (codeExample: string): string => {
+    const trimmed = codeExample.trim();
+    const withoutOpeningFence = trimmed.replace(/^```\w*\s*\n?/, '');
+    const withoutClosingFence = withoutOpeningFence.replace(/\n?```\s*$/, '');
+    return withoutClosingFence.trimEnd();
+  };
 
   private getFileContent = async (projectId: number, filePath: string, ref = 'main'): Promise<string> => {
     try {
