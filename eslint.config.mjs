@@ -2,7 +2,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import typescriptEslint from '@typescript-eslint/eslint-plugin';
-import stylisticTs from '@stylistic/eslint-plugin-ts';
+import stylistic from '@stylistic/eslint-plugin';
 import globals from 'globals';
 import tsParser from '@typescript-eslint/parser';
 import js from '@eslint/js';
@@ -23,7 +23,7 @@ const eslint = [
   {
     plugins: {
       '@typescript-eslint': typescriptEslint,
-      '@stylistic/ts': stylisticTs,
+      '@stylistic': stylistic,
     },
     languageOptions: {
       globals: {

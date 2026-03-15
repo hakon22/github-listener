@@ -31,7 +31,6 @@ export abstract class ModelBaseService extends BaseService {
         baseURL,
       },
       model,
-      dimensions: 1536,
     });
   };
 }

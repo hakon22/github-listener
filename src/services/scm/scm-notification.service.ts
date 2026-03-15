@@ -11,6 +11,8 @@ interface PushNotificationParamsInterface {
   humanSummary: string;
   commitsSummary: string;
   analysisSummary: string;
+  processedFilesCount?: number;
+  processedFilePaths?: string[];
 }
 
 interface PullRequestNotificationParamsInterface {
@@ -22,6 +24,8 @@ interface PullRequestNotificationParamsInterface {
   author: string;
   humanSummary: string;
   analysisSummary: string;
+  processedFilesCount?: number;
+  processedFilePaths?: string[];
 }
 
 @Singleton
@@ -36,6 +40,14 @@ export class ScmNotificationService {
       `Коммитов: <b>${params.commitsCount}</b>`,
       `Затронуто файлов: <b>${params.filesCount}</b>`,
     ];
+
+    if (params.processedFilesCount !== undefined && params.processedFilesCount > 0) {
+      textLines.push(`Обработано моделью: <b>${params.processedFilesCount}</b> файлов`);
+      if (params.processedFilePaths && params.processedFilePaths.length < 10) {
+        const escapedPaths = params.processedFilePaths.map((filePath) => `<code>${filePath.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;')}</code>`);
+        textLines.push(escapedPaths.join('\n'));
+      }
+    }
 
     if (params.humanSummary) {
       textLines.push('', `<b>Суть изменений:</b> ${params.humanSummary}`);
@@ -61,6 +73,14 @@ export class ScmNotificationService {
       params.pullRequestUrl ? `Ссылка: ${params.pullRequestUrl}` : '',
       `Автор: <b>${params.author}</b>`,
     ].filter(Boolean);
+
+    if (params.processedFilesCount !== undefined && params.processedFilesCount > 0) {
+      textLines.push('', `Обработано моделью: <b>${params.processedFilesCount}</b> файлов`);
+      if (params.processedFilePaths && params.processedFilePaths.length < 10) {
+        const escapedPaths = params.processedFilePaths.map((filePath) => `<code>${filePath.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;')}</code>`);
+        textLines.push(escapedPaths.join('\n'));
+      }
+    }
 
     if (params.humanSummary) {
       textLines.push('', `<b>Суть изменений:</b> ${params.humanSummary}`);

@@ -66,9 +66,14 @@ export class VectorStoreService extends ModelBaseService {
     this.loggerService.info(this.TAG, `Indexing ${changes.length} file changes for embeddings`);
 
     // Разбиваем большие файлы на чанки, чтобы не превышать лимит токенов модели.
+    // README.md и прочие .md не индексируем.
     const items: { file: string; content: string; }[] = [];
 
     for (const change of changes) {
+      const filePathLower = change.file.toLowerCase().replace(/\\/g, '/');
+      if (filePathLower.endsWith('.md')) {
+        continue;
+      }
       const normalized = this.normalizeContent(change.newContent);
       const chunks = this.chunkContent(normalized);
 
@@ -158,10 +163,12 @@ export class VectorStoreService extends ModelBaseService {
   };
 
   /**
-   * Грубое разбиение по символам, чтобы не упираться в лимит 8192 токена.
-   * Для кода берём ~8000 символов на чанк, что даёт заметный запас по токенам.
+   * Разбиение по символам под лимит эмбеддинг-модели 8K токенов.
+   * 8K токенов × ~4 символа/токен ≈ 32K символов на чанк.
    */
-  private chunkContent = (content: string, maxChars = 8000): string[] => {
+  private static readonly EMBEDDING_MAX_CHARS_PER_CHUNK = 32000;
+
+  private chunkContent = (content: string, maxChars = VectorStoreService.EMBEDDING_MAX_CHARS_PER_CHUNK): string[] => {
     if (content.length <= maxChars) {
       return [content];
     }

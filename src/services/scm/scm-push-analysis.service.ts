@@ -25,6 +25,8 @@ export interface RunPushAnalysisResult {
   analysisSummary: string;
   humanSummary: string;
   commitsSummary: string;
+  processedFilesCount: number;
+  processedFilePaths: string[];
 }
 
 @Singleton
@@ -66,15 +68,23 @@ export class ScmPushAnalysisService {
         }
       }
 
-      const getFileContent = driver.getAffectedPathsInput().getFileContent;
+      mergedChanges = mergedChanges.filter(
+        (change) => !ScmReviewService.isMarkdownFile(change.file),
+      );
+
+      const affectedInput = driver.getAffectedPathsInput();
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
         commits,
         summaryTitle,
-        { getFileContent },
+        {
+          getFileContent: affectedInput.getFileContent,
+          getSourceFilePaths: affectedInput.getSourceFilePaths,
+        },
       );
 
       const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
+      const processedFilePaths = mergedChanges.map((change) => change.file);
 
       this.loggerService.info(this.TAG, 'Push analysis completed successfully');
 
@@ -82,6 +92,8 @@ export class ScmPushAnalysisService {
         analysisSummary: analysisResult.analysisSummary,
         humanSummary: analysisResult.humanSummary,
         commitsSummary,
+        processedFilesCount: processedFilePaths.length,
+        processedFilePaths,
       };
     } catch (error) {
       const errorInstance = error as Error;
@@ -93,6 +105,8 @@ export class ScmPushAnalysisService {
         analysisSummary: this.scmReviewService.buildAnalysisErrorSummary(error),
         humanSummary: '',
         commitsSummary,
+        processedFilesCount: 0,
+        processedFilePaths: [],
       };
     }
   };

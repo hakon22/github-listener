@@ -91,7 +91,15 @@ export class GitlabWebhookController extends BaseService {
       filePath,
       ref,
     );
-    const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes, getFileContent);
+    const getSourceFilePaths = () => this.gitlabAgentService.getRepositorySourceFilePaths(
+      projectId,
+      ref,
+      { maxFiles: 200 },
+    );
+    const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes, {
+      getFileContent,
+      getSourceFilePaths,
+    });
 
     await this.gitlabAgentService.addComments(projectId, mergeRequestIid, recommendations);
 
@@ -118,12 +126,13 @@ export class GitlabWebhookController extends BaseService {
     let analysisSummary = '';
     let humanSummary = '';
     let commitsSummary = '';
+    let pushResult: Awaited<ReturnType<ScmPushAnalysisService['run']>> | undefined;
 
     if (filesCount > 0) {
       const changedPaths = Array.from(changedFiles);
       const ref = event.after ?? branch;
 
-      const result = await this.scmPushAnalysisService.run({
+      pushResult = await this.scmPushAnalysisService.run({
         driver: {
           getInitialChanges: () => (event.before && event.after
             ? this.gitlabAgentService.getPushChanges(projectId, event.before, event.after, changedPaths)
@@ -156,9 +165,9 @@ export class GitlabWebhookController extends BaseService {
         errorContext: 'Failed to analyze code for GitLab push event',
       });
 
-      analysisSummary = result.analysisSummary;
-      humanSummary = result.humanSummary;
-      commitsSummary = result.commitsSummary;
+      analysisSummary = pushResult.analysisSummary;
+      humanSummary = pushResult.humanSummary;
+      commitsSummary = pushResult.commitsSummary;
     } else {
       commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
     }
@@ -174,6 +183,8 @@ export class GitlabWebhookController extends BaseService {
       humanSummary: this.scmReviewService.escapeHtml(humanSummary),
       commitsSummary,
       analysisSummary,
+      processedFilesCount: pushResult?.processedFilesCount,
+      processedFilePaths: pushResult?.processedFilePaths,
     });
     await this.telegramService.sendAdminMessage(messageText, { parse_mode: 'HTML' });
 

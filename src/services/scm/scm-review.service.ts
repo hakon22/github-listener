@@ -2,7 +2,7 @@ import * as path from 'path';
 import { Container, Singleton } from 'typescript-ioc';
 
 import { AIService } from '@/services/analysis/ai.service';
-import type { AICodeIssueRecommendation, GetFileContentFn } from '@/services/analysis/ai.service';
+import type { AICodeIssueRecommendation, GetFileContentFn, LogicalDataLoadingOptions } from '@/services/analysis/ai.service';
 import { CodeAnalyzerService } from '@/services/analysis/code-analyzer.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
@@ -29,6 +29,9 @@ interface CategorizedRecommendationsInterface {
 export class ScmReviewService {
   private static readonly TOP_ISSUES_LIMIT = 3;
 
+  public static isMarkdownFile = (filePath: string): boolean =>
+    filePath.toLowerCase().replace(/\\/g, '/').endsWith('.md');
+
   private readonly analyzerService = Container.get(CodeAnalyzerService);
 
   private readonly aiService = Container.get(AIService);
@@ -39,9 +42,10 @@ export class ScmReviewService {
     changes: ScmChangeInterface[],
     commits: ScmCommitSummaryInterface[],
     summaryTitle: string,
-    options?: { getFileContent?: GetFileContentFn; },
+    options?: { getFileContent?: GetFileContentFn; getSourceFilePaths?: () => Promise<string[]>; },
   ): Promise<{ analysisSummary: string; humanSummary: string; }> => {
-    const recommendations = await this.getRecommendationsForChanges(changes, options?.getFileContent);
+    const analyzableChanges = changes.filter((change) => !ScmReviewService.isMarkdownFile(change.file));
+    const recommendations = await this.getRecommendationsForChanges(analyzableChanges, options);
     const categorizedRecommendations = this.categorizeRecommendations(recommendations);
 
     const topIssues = [
@@ -52,14 +56,14 @@ export class ScmReviewService {
     const humanSummary = await this.aiService.summarizePush(
       commits,
       topIssues,
-      changes,
+      analyzableChanges,
     );
 
     const analysisSummary = this.buildAnalysisSummary(
       summaryTitle,
       categorizedRecommendations,
       topIssues,
-      changes,
+      analyzableChanges,
     );
 
     return {
@@ -70,12 +74,13 @@ export class ScmReviewService {
 
   public getRecommendationsForChanges = async (
     changes: ScmChangeInterface[],
-    getFileContent?: GetFileContentFn,
+    options?: LogicalDataLoadingOptions | GetFileContentFn,
   ): Promise<AICodeIssueRecommendation[]> => {
-    await this.vectorStoreService.indexMergeRequestChanges(changes);
+    const analyzableChanges = changes.filter((change) => !ScmReviewService.isMarkdownFile(change.file));
+    await this.vectorStoreService.indexMergeRequestChanges(analyzableChanges);
 
-    const analysis = await this.analyzerService.analyzeChanges(changes);
-    const logicalDataIssues = await this.aiService.getLogicalDataLoadingIssues(changes, getFileContent);
+    const analysis = await this.analyzerService.analyzeChanges(analyzableChanges);
+    const logicalDataIssues = await this.aiService.getLogicalDataLoadingIssues(analyzableChanges, options);
     const allIssues = [...analysis, ...logicalDataIssues];
     return this.aiService.getRecommendations(allIssues);
   };

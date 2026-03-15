@@ -82,12 +82,13 @@ export class GithubWebhookController extends BaseService {
     let analysisSummary = '';
     let humanSummary = '';
     let commitsSummary = '';
+    let pushResult: Awaited<ReturnType<ScmPushAnalysisService['run']>> | undefined;
 
     if (filesCount > 0) {
       const changedPaths = Array.from(changedFiles);
       const ref = event.after ?? branch;
 
-      const result = await this.scmPushAnalysisService.run({
+      pushResult = await this.scmPushAnalysisService.run({
         driver: {
           getInitialChanges: () => (event.before && event.after
             ? this.githubAgent.getPushChanges(
@@ -138,9 +139,9 @@ export class GithubWebhookController extends BaseService {
         errorContext: 'Failed to analyze code for GitHub push event',
       });
 
-      analysisSummary = result.analysisSummary;
-      humanSummary = result.humanSummary;
-      commitsSummary = result.commitsSummary;
+      analysisSummary = pushResult.analysisSummary;
+      humanSummary = pushResult.humanSummary;
+      commitsSummary = pushResult.commitsSummary;
     } else {
       commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
     }
@@ -156,6 +157,8 @@ export class GithubWebhookController extends BaseService {
       humanSummary: this.scmReviewService.escapeHtml(humanSummary),
       commitsSummary,
       analysisSummary,
+      processedFilesCount: pushResult?.processedFilesCount,
+      processedFilePaths: pushResult?.processedFilePaths,
     });
 
     await this.telegramService.sendAdminMessage(text, { parse_mode: 'HTML' });
@@ -187,6 +190,8 @@ export class GithubWebhookController extends BaseService {
 
     let analysisSummary = '';
     let humanSummary = '';
+    let processedFilesCount: number | undefined;
+    let processedFilePaths: string[] | undefined;
 
     try {
       const changes = await this.githubAgent.getPullRequestChanges(
@@ -237,21 +242,32 @@ export class GithubWebhookController extends BaseService {
         }
       }
 
+      mergedChanges = mergedChanges.filter(
+        (change) => !ScmReviewService.isMarkdownFile(change.file),
+      );
       const getFileContent = (filePath: string) => this.githubAgent.getFileContentAtRef(
         repositoryOwner,
         event.repository.name,
         filePath,
         ref,
       );
+      const getSourceFilePaths = () => this.githubAgent.getRepositorySourceFilePaths(
+        repositoryOwner,
+        event.repository.name,
+        ref,
+        { maxFiles: 200 },
+      );
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
         [],
         '<b>Результаты анализа кода по Pull Request</b>',
-        { getFileContent },
+        { getFileContent, getSourceFilePaths },
       );
 
       analysisSummary = analysisResult.analysisSummary;
       humanSummary = analysisResult.humanSummary;
+      processedFilesCount = mergedChanges.length;
+      processedFilePaths = mergedChanges.map((change) => change.file);
     } catch (error) {
       const errorInstance = error as Error;
       this.loggerService.error(this.TAG, 'Failed to analyze code for GitHub pull_request event', errorInstance);
@@ -268,6 +284,8 @@ export class GithubWebhookController extends BaseService {
       author: this.scmReviewService.escapeHtml(author),
       humanSummary: this.scmReviewService.escapeHtml(humanSummary),
       analysisSummary,
+      processedFilesCount,
+      processedFilePaths,
     });
 
     await this.telegramService.sendAdminMessage(text, { parse_mode: 'HTML' });

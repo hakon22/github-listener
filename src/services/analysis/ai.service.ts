@@ -12,6 +12,12 @@ import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 export type GetFileContentFn = (filePath: string) => Promise<string>;
 
+export interface LogicalDataLoadingOptions {
+  getFileContent?: GetFileContentFn;
+  /** Список путей исходных файлов репозитория для поиска файлов, которые импортируют изменённые (места вызова). */
+  getSourceFilePaths?: () => Promise<string[]>;
+}
+
 interface TsconfigPathsInterface {
   baseUrl: string;
   paths: Record<string, string[]>;
@@ -45,6 +51,56 @@ interface SummaryChangeItem {
   newContent: string;
 }
 
+interface ParameterPropertyAccessEntry {
+  parameterIndex: number;
+  propertyPath: string;
+  requiresExactRelation: boolean;
+  line: number;
+}
+
+interface ParameterPropertyAccessTarget {
+  key: string;
+  kind: 'function' | 'method';
+  name: string;
+  className?: string;
+  filePath: string;
+  parameterNames: string[];
+  destructuredProperties: string[];
+  propertyAccesses: string[];
+  propertyAccessEntries: ParameterPropertyAccessEntry[];
+}
+
+interface QueryRelationSource {
+  filePath: string;
+  variableName: string;
+  relationPaths: string[];
+  sourceText: string;
+}
+
+interface CallSiteArgumentInfo {
+  index: number;
+  name: string;
+  relationPaths: string[];
+  sourceText: string;
+}
+
+interface CallSiteTraceInfo {
+  file: string;
+  callee: string;
+  arguments: CallSiteArgumentInfo[];
+}
+
+interface TraceabilityPayloadItem {
+  target: string;
+  definitionFile: string;
+  parameterNames: string[];
+  destructuredProperties: string[];
+  propertyAccesses: string[];
+  callSiteFiles: string[];
+  callSites: CallSiteTraceInfo[];
+  propertyAccessEntries: ParameterPropertyAccessEntry[];
+}
+
 @Singleton
 export class AIService extends ModelBaseService {
   private readonly codeReviewPrompt: PromptTemplate;
@@ -55,11 +111,20 @@ export class AIService extends ModelBaseService {
 
   private readonly mergeSummariesPrompt: PromptTemplate;
 
-  /** Лимит символов на один батч изменений (≈ лимит токенов × 4), чтобы не превышать контекст модели. */
-  private static readonly MAX_CHARS_PER_BATCH = 22000;
+  /** Контекст модели 262K токенов; ≈4 символа на токен. Резерв под ответ и системный промпт ~50K токенов → ~848K символов на батч. */
+  private static readonly MAX_CHARS_PER_BATCH = 848000;
+
+  /** Лимит символов для анализа загрузки данных (тот же контекст 262K). */
+  private static readonly LOGICAL_DATA_LOADING_MAX_CHARS = 848000;
+
+  /** Максимум символов на один файл при отправке в анализ загрузки данных (обрезание только очень больших файлов). */
+  private static readonly LOGICAL_DATA_LOADING_MAX_CHARS_PER_FILE = 80000;
 
   /** Минимальный интервал между запросами к модели (не более 1 запроса в секунду). */
   private static readonly MIN_REQUEST_INTERVAL_MS = 1000;
+
+  /** Строка содержит обращение к свойству (obj.prop или obj?.prop). */
+  private static readonly PROPERTY_ACCESS_LINE_PATTERN = /\.\s*\w|\?\s*\.\s*\w|\{\s*[^}]*\}\s*=|\(\s*\{[^)]*\}\s*\)/;
 
   private readonly vectorStoreService = Container.get(VectorStoreService);
 
@@ -134,32 +199,63 @@ export class AIService extends ModelBaseService {
     `);
 
     this.logicalDataLoadingPrompt = PromptTemplate.fromTemplate(`
-      Ты — опытный ревьюер кода. Выполни логический анализ загрузки данных.
+      Ты — AI-агент по анализу безопасного доступа к свойствам объектов в TypeScript/Node.js.
       
-      Тебе переданы файлы (поле "file" — путь, "content" — содержимое). Часть из них — изменённые в MR/коммите, часть — файлы, в которые из изменённых передаётся результат запроса (импортируемые модули). Все их нужно анализировать вместе.
+      Тебе переданы:
+      1) ГЛАВНЫЕ ФАЙЛЫ (источники данных) — здесь формируются/загружаются объекты (БД: TypeORM find/findOne с relations, createQueryBuilder с join, Prisma include/select, Knex и т.д.; API/кэш; явная инициализация).
+      2) ФАЙЛЫ ИСПОЛЬЗОВАНИЯ — код, где эти объекты используются или передаются дальше.
+      3) TRACEABILITY (JSON) — для каждой функции/метода (target): definitionFile (где определена), propertyAccessEntries (parameterIndex, propertyPath, line — где в коде обращаются к свойству параметра), callSites (где вызывают эту функцию: file, callee, arguments с relationPaths и sourceText для аргументов из find/findOne).
       
-      В файлах могут быть запросы к БД: TypeORM (findOne/find с relations, createQueryBuilder с join'ами), Knex, raw SQL, Prisma, Drizzle и т.д. Результат запроса может сохраняться в переменную и передаваться в другую функцию — в том числе в функцию из другого файла. Обращение к полям/связям может быть как в том же файле, где запрос, так и в файле, куда переменная передана параметром.
+      УЧИТЫВАЙ ЦЕПОЧКУ ВЫЗОВОВ И СВЯЗАННЫЕ ФАЙЛЫ:
+      У тебя есть callSites (кто вызывает функцию) и связанные файлы (sourceFiles, usageFiles, callSiteFiles). Если свойство подгружено в верхней (вызывающей) функции — объект уже приходит с этим полем. НЕ сообщай проблему, если:
+      - в любом из callSites для этого target аргумент имеет relationPaths, покрывающие propertyPath (значит, в том вызове объект загружен с нужной связью);
+      - в файле вызова (callSites[].file) или в definitionFile в коде загрузки (find/findOne/relations/join/include) указана эта связь;
+      - объект создаётся или подгружается с propertyPath в любом из переданных тебе файлов (главные или использования).
+      Сообщай проблему только если ни в одном месте цепочки вызовов и ни в одном связанном файле свойство не загружается.
       
-      Задача: найди все места, где к результату запроса (или к аргументу, в который он передан) обращаются по свойствам/связям, которые запрос не загружает (включая обход массивов и вложенные поля). Это приведёт к undefined или ошибке в рантайме.
+      ГЛАВНОЕ ПРАВИЛО — СВЯЗЫВАЙ КАЖДУЮ ПРОБЛЕМУ С КОНКРЕТНОЙ ЦЕПОЧКОЙ:
+      Сообщай проблему ТОЛЬКО если ты для неё явно установил:
+      (1) Место использования: файл и строка (file, line) — где в коде обращаются к свойству объекта (должно совпадать с одним из propertyAccessEntries в TRACEABILITY).
+      (2) Источник объекта: откуда объект попал в эту функцию — либо definitionFile (объект создаётся в том же файле), либо один из callSites[].file и конкретный аргумент с relationPaths (объект пришёл из вызова).
+      (3) Свойство: propertyPath — какая цепочка свойств используется (например order.delivery.address).
+      (4) Доказательство несоответствия: ни в источнике, ни в других callSites, ни в связанных файлах НЕТ загрузки этого propertyPath (relations/include/select/join); для вложенных связей нужна полная цепочка.
       
-      ВАЖНО — как считать «загружено»:
-      - TypeORM: если в findOne/find передан relations и в нём есть строка с путём к связи (например 'order', 'order.delivery', 'order.positions.item'), то обращение к этой связи в коде после запроса НЕ является проблемой. Одна переменная — один запрос: проследи, что именно эта переменная получена из запроса с нужными relations.
-      - Аналогично для createQueryBuilder с leftJoinAndSelect/innerJoinAndSelect, Prisma include/select, Knex join — если связь явно подгружена в этом запросе, не сообщай о проблеме.
-      - Сообщай только когда запрос, который возвращает сущность, действительно не содержит нужной связи в relations/join/include/select.
+      Если не можешь для данной строки заполнить sourceFile, sourceLine и propertyPath по данным TRACEABILITY и коду — проблему НЕ сообщай. Не помечай объекты «на всякий случай».
       
-      Файлы для анализа (JSON-массив объектов с полями "file", "content"):
-      {files}
+      УЧЁТ ТИПИЗАЦИИ (TypeScript):
+      - Смотри на объявления типов в коде: interface, type, типы параметров и возвращаемых значений.
+      - Свойство с модификатором optional (prop?: Type) в типе объекта — по контракту может быть undefined. Доступ к такому свойству без проверки — стилистический риск, но НЕ ошибка «свойство не загружено». Такую проблему НЕ сообщай.
+      - Сообщай проблему только если свойство в типе объявлено как обязательное (prop: Type, без ?), а в источнике данных (relations/include/select/запрос) оно не загружается — тогда в рантайме возможен undefined вопреки типу.
+      - Если тип сущности взят из ORM/Prisma (entity, model), учитывай: поля связей часто опциональны в типах (relation?: Entity[]), пока связь не загружена. Для таких полей без загрузки в запросе проблему не сообщай.
+      - Итог: опциональное в типе (?) — не сообщай; обязательное в типе, но не загружается в источнике — сообщай.
       
-      Верни JSON-массив проблем СТРОГО такого вида (если проблем нет — пустой массив []):
+      КОД СЧИТАЕТСЯ БЕЗОПАСНЫМ — НЕ СООБЩАЙ ПРОБЛЕМУ, ТОЛЬКО ЕСЛИ ВИДИШЬ:
+      - В строке использования есть optional chaining (?.), nullish coalescing (??), деструктуризация с умолчанием или явная проверка на undefined/null — тогда доступ уже защищён.
+      - Объект загружен с нужными полями в любом из связанных файлов или в callSites (relationPaths покрывают propertyPath).
+      - Свойство в типе объекта объявлено как опциональное (prop?: Type).
+      Иначе: если загрузки свойства нет ни в цепочке вызовов, ни в связанных файлах, и в коде обращение без ?./??/проверки — ОБЯЗАТЕЛЬНО сообщи проблему (риск runtime-ошибки).
+      
+      ОСОБЫЕ ПРАВИЛА ДЛЯ ORM:
+      - relations/include/select/join = загрузка. Загружено в верхней функции или в callSite — считай, что объект пришёл уже с полем.
+      - Сообщай проблему только если проследил по всей цепочке: ни в одном callSite, ни в sourceFile, ни в других связанных файлах propertyPath не загружается.
+      
+      TRACEABILITY (JSON):
+      {traceability}
+      
+      ГЛАВНЫЕ ФАЙЛЫ (источники данных), JSON-массив объектов с полями "file", "content":
+      {sourceFiles}
+      
+      ФАЙЛЫ ИСПОЛЬЗОВАНИЯ И ФАЙЛЫ С ТИПАМИ (все вместе), JSON-массив объектов с полями "file", "content":
+      сюда входят код использования и файлы, импортируемые из главных и из использования (в т.ч. только типы: import type). Типы и интерфейсы могут быть в любом из этих файлов — смотри interface/type в них, чтобы определить обязательное (prop: Type) или опциональное (prop?: Type) свойство.
+      {usageFiles}
+      
+      Формат ответа — JSON-массив. Каждый элемент ОБЯЗАТЕЛЬНО содержит: file, line, message, sourceFile, sourceLine, propertyPath.
+      sourceFile — файл, где объект загружается/создаётся (или откуда передаётся в вызове). sourceLine — строка в нём (1-based). propertyPath — цепочка свойств (например order.delivery.address).
+      Если не можешь указать sourceFile и propertyPath для проблемы — не включай её в массив.
       [
-        {{ "file": "путь/к/файлу", "line": номер_строки_где_обращение_к_данным, "message": "краткое описание по-русски" }}
+        {{ "file": "путь/файла_использования", "line": номер_строки, "message": "краткое описание по-русски", "sourceFile": "путь/файла_источника", "sourceLine": номер_строки_источника, "propertyPath": "цепочка.свойств" }}
       ]
-      
-      ТРЕБОВАНИЯ:
-      - Пиши ТОЛЬКО по-русски в поле message.
-      - Указывай реальные file и line по коду (в том числе в файле, куда передана константа).
-      - Не выдумывай проблем: только явное несоответствие «запрос не подгружает X, а код читает X». Если связь подгружена в том же запросе — не включай в ответ.
-      - Выведи ТОЛЬКО JSON-массив без Markdown и текста вне JSON.
+      ИТОГ: Пиши ТОЛЬКО по-русски в message. Выведи ТОЛЬКО JSON-массив без Markdown и текста вне JSON.
     `);
       
     this.pushSummaryPrompt = PromptTemplate.fromTemplate(`
@@ -184,7 +280,7 @@ export class AIService extends ModelBaseService {
       Не описывай весь файл целиком — только то, что реально изменилось. Опирайся на "diff"; "newContent" — для контекста при необходимости.
       
       Ответ: максимум 3-4 коротких предложения, по-русски, без Markdown и списков.
-      Если есть важные проблемы по анализу — кратко упомяни. Если критичных нет — можно написать, что критичных проблем не обнаружено.
+      Если в "Проблемы" передан непустой массив — обязательно упомяни хотя бы одну-две проблемы (файл, суть). Фразу «критичных проблем не обнаружено» пиши только если массив проблем действительно пуст.
       
       ТРЕБОВАНИЯ: Пиши ТОЛЬКО по-русски, простой текст. Опирайся на "diff".
     `);
@@ -278,40 +374,105 @@ export class AIService extends ModelBaseService {
   };
 
   /**
-   * Логический анализ загрузки данных: модель проверяет, что код не обращается к полям/связям,
-   * которые не загружаются запросом (любой стиль: TypeORM, Knex, Prisma, raw SQL и т.д.).
-   * Если передан getFileContent, в контекст добавляются файлы, импортируемые из изменённых
-   * (куда может прокидываться результат запроса).
+   * Логический анализ загрузки данных: модель проверяет безопасное извлечение свойств из объекта.
+   * Если свойство загружено в запросе — ошибки не должно быть.
+   * Если свойство передано параметром — собираются файлы-вызыватели и проверяется, что там свойство загружено или определено.
+   * В контекст передаются главные файлы (источники данных) и файлы использования (в т.ч. места вызова).
    */
-  public getLogicalDataLoadingIssues = async (changes: ScmChangeInterface[], getFileContent?: GetFileContentFn): Promise<CodeIssueInterface[]> => {
+  public getLogicalDataLoadingIssues = async (
+    changes: ScmChangeInterface[],
+    optionsOrGetFileContent?: GetFileContentFn | LogicalDataLoadingOptions,
+  ): Promise<CodeIssueInterface[]> => {
+    const options: LogicalDataLoadingOptions =
+      typeof optionsOrGetFileContent === 'function'
+        ? { getFileContent: optionsOrGetFileContent }
+        : optionsOrGetFileContent ?? {};
+    const getFileContent = options.getFileContent;
+    const getSourceFilePaths = options.getSourceFilePaths;
+
     const allowedExtensions = ['.ts', '.tsx'];
-    const filesPayload: { file: string; content: string; }[] = [];
+    const sourceFilesPayload: { file: string; content: string; }[] = [];
+    const usageFilesPayload: { file: string; content: string; }[] = [];
     const seenPaths = new Set<string>();
     let totalChars = 0;
+    const changedPathsNormalized = new Set<string>();
+    const parameterPropertyAccessTargets = this.collectParameterPropertyAccessTargetsFromChanges(changes);
+    let traceabilityPayload: TraceabilityPayloadItem[] = [];
+    let callSiteFilesByTargetKey = new Map<string, Set<string>>();
+    let callSitesByTargetKey = new Map<string, CallSiteTraceInfo[]>();
+
+    const maxTotalChars = AIService.LOGICAL_DATA_LOADING_MAX_CHARS;
+    const maxCharsPerFile = AIService.LOGICAL_DATA_LOADING_MAX_CHARS_PER_FILE;
+    const reservedForUsage = Math.floor(maxTotalChars / 2);
 
     for (const change of changes) {
       const extension = change.file.slice(change.file.lastIndexOf('.')).toLowerCase();
       if (!allowedExtensions.includes(extension) || !change.newContent?.trim()) {
         continue;
       }
-      const content = change.newContent.slice(0, 12000);
-      if (totalChars + content.length > AIService.MAX_CHARS_PER_BATCH) {
+      const content = change.newContent.slice(0, maxCharsPerFile);
+      if (totalChars + content.length > maxTotalChars - reservedForUsage) {
         break;
       }
       const normalizedPath = path.normalize(change.file).replace(/\\/g, '/');
+      changedPathsNormalized.add(this.normalizePathWithoutExtension(change.file));
       if (!seenPaths.has(normalizedPath)) {
         seenPaths.add(normalizedPath);
-        filesPayload.push({ file: change.file, content });
+        sourceFilesPayload.push({ file: change.file, content });
         totalChars += content.length;
       }
     }
 
-    if (getFileContent && filesPayload.length) {
+    if (getFileContent && sourceFilesPayload.length > 0) {
       const tsconfigPaths = await this.loadTsconfigPaths(getFileContent);
       const pathResolver = this.buildPathResolver(tsconfigPaths);
+
+      const addUsageFileContent = async (filePath: string): Promise<void> => {
+        if (totalChars >= maxTotalChars) {
+          return;
+        }
+        const normalized = path.normalize(filePath).replace(/\\/g, '/');
+        if (seenPaths.has(normalized)) {
+          return;
+        }
+        try {
+          const content = await getFileContent(filePath);
+          if (!content?.trim()) {
+            return;
+          }
+          const slice = content.slice(0, maxCharsPerFile);
+          if (totalChars + slice.length <= maxTotalChars) {
+            seenPaths.add(normalized);
+            usageFilesPayload.push({ file: filePath, content: slice });
+            totalChars += slice.length;
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      const callSiteCollectionResult = getSourceFilePaths && parameterPropertyAccessTargets.length > 0
+        ? await this.collectCallSiteFilePaths(
+          parameterPropertyAccessTargets,
+          getSourceFilePaths,
+          getFileContent,
+        )
+        : null;
+
+      if (callSiteCollectionResult) {
+        callSiteFilesByTargetKey = callSiteCollectionResult.callSiteFilesByTargetKey;
+        callSitesByTargetKey = callSiteCollectionResult.callSitesByTargetKey;
+        for (const callSitePath of callSiteCollectionResult.callSiteFiles) {
+          await addUsageFileContent(callSitePath);
+          if (totalChars >= maxTotalChars) {
+            break;
+          }
+        }
+      }
+
       const importedPaths = this.collectImportedPathsFromChanges(changes, pathResolver);
       for (const resolvedPathBase of importedPaths) {
-        if (totalChars >= AIService.MAX_CHARS_PER_BATCH) {
+        if (totalChars >= maxTotalChars) {
           break;
         }
         if (resolvedPathBase.includes('node_modules')) {
@@ -319,8 +480,8 @@ export class AIService extends ModelBaseService {
         }
         let content: string | null = null;
         let resolvedWithExt = '';
-        for (const extension of ['.ts', '.tsx']) {
-          const candidate = resolvedPathBase + extension;
+        for (const ext of ['.ts', '.tsx']) {
+          const candidate = resolvedPathBase + ext;
           const normalized = path.normalize(candidate).replace(/\\/g, '/');
           if (seenPaths.has(normalized)) {
             content = null;
@@ -335,18 +496,89 @@ export class AIService extends ModelBaseService {
           }
         }
         if (content && content.trim() && resolvedWithExt) {
-          const slice = content.slice(0, 12000);
-          if (totalChars + slice.length <= AIService.MAX_CHARS_PER_BATCH) {
+          const slice = content.slice(0, maxCharsPerFile);
+          if (totalChars + slice.length <= maxTotalChars) {
             seenPaths.add(path.normalize(resolvedWithExt).replace(/\\/g, '/'));
-            filesPayload.push({ file: resolvedWithExt, content: slice });
+            usageFilesPayload.push({ file: resolvedWithExt, content: slice });
             totalChars += slice.length;
           }
         }
       }
+
+      const addTypeDefinitionFileContent = async (filePath: string): Promise<void> => {
+        if (totalChars >= maxTotalChars) {
+          return;
+        }
+        const normalized = path.normalize(filePath).replace(/\\/g, '/');
+        if (seenPaths.has(normalized)) {
+          return;
+        }
+        try {
+          const content = await getFileContent(filePath);
+          if (!content?.trim()) {
+            return;
+          }
+          const slice = content.slice(0, maxCharsPerFile);
+          if (totalChars + slice.length <= maxTotalChars) {
+            seenPaths.add(normalized);
+            usageFilesPayload.push({ file: filePath, content: slice });
+            totalChars += slice.length;
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      const allFilesForImportScan = [...sourceFilesPayload, ...usageFilesPayload];
+      const secondLevelImportPaths = this.collectImportedPathsFromFiles(allFilesForImportScan, pathResolver);
+      for (const resolvedPathBase of secondLevelImportPaths) {
+        if (totalChars >= maxTotalChars) {
+          break;
+        }
+        if (resolvedPathBase.includes('node_modules')) {
+          continue;
+        }
+        for (const ext of ['.ts', '.tsx']) {
+          const candidate = resolvedPathBase + ext;
+          const normalized = path.normalize(candidate).replace(/\\/g, '/');
+          if (seenPaths.has(normalized)) {
+            break;
+          }
+          try {
+            await addTypeDefinitionFileContent(candidate);
+            break;
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      if (getSourceFilePaths && changedPathsNormalized.size > 0) {
+        const callerPaths = await this.collectCallerFilePaths(
+          Array.from(changedPathsNormalized),
+          getSourceFilePaths,
+          getFileContent,
+          pathResolver,
+        );
+        for (const callerPath of callerPaths) {
+          await addUsageFileContent(callerPath);
+        }
+      }
     }
 
-    if (filesPayload.length === 0) {
-      return [];
+    traceabilityPayload = this.buildTraceabilityPayload(
+      parameterPropertyAccessTargets,
+      callSiteFilesByTargetKey,
+      callSitesByTargetKey,
+    );
+    const staticIssues = this.buildStaticRelationIssues(
+      parameterPropertyAccessTargets,
+      callSitesByTargetKey,
+    );
+
+    const hasAnyFiles = sourceFilesPayload.length > 0 || usageFilesPayload.length > 0;
+    if (!hasAnyFiles) {
+      return staticIssues;
     }
 
     const llm = await this.getLlm();
@@ -357,35 +589,191 @@ export class AIService extends ModelBaseService {
     ]);
 
     const result = await chain.invoke({
-      files: JSON.stringify(filesPayload),
+      sourceFiles: JSON.stringify(sourceFilesPayload),
+      usageFiles: JSON.stringify(usageFilesPayload),
+      traceability: JSON.stringify(traceabilityPayload),
     });
 
-    let items: Array<{ file: string; line: number; message: string }> = [];
+    const sourcePathsSet = new Set(
+      sourceFilesPayload.map((payload) => path.normalize(payload.file).replace(/\\/g, '/')),
+    );
+    const usagePathsSet = new Set(
+      usageFilesPayload.map((payload) => path.normalize(payload.file).replace(/\\/g, '/')),
+    );
+    const allKnownPathsSet = new Set([...sourcePathsSet, ...usagePathsSet]);
+
+    let items: Array<{ file: string; line: number; message: string; sourceFile: string; sourceLine: number; propertyPath: string }> = [];
 
     try {
       const jsonText = this.extractJsonPayload(result);
       const parsed = JSON.parse(jsonText) as unknown;
       if (Array.isArray(parsed)) {
-        items = parsed.filter(
-          (item): item is { file: string; line: number; message: string } =>
-            typeof item === 'object' &&
-            item !== null &&
-            'file' in item &&
-            'line' in item &&
-            'message' in item,
-        );
+        items = parsed
+          .filter(
+            (item): item is { file: string; line: unknown; message: string; sourceFile: unknown; sourceLine: unknown; propertyPath: unknown } =>
+              typeof item === 'object' &&
+              item !== null &&
+              'file' in item &&
+              'line' in item &&
+              'message' in item &&
+              'sourceFile' in item &&
+              item.sourceFile != null &&
+              String(item.sourceFile).trim() !== '' &&
+              'propertyPath' in item &&
+              item.propertyPath != null &&
+              String(item.propertyPath).trim() !== '',
+          )
+          .map((item) => ({
+            file: String(item.file),
+            line: this.normalizeLineNumberOneBased(item.line),
+            message: String(item.message),
+            sourceFile: String(item.sourceFile).trim(),
+            sourceLine: this.normalizeLineNumberOneBased(item.sourceLine),
+            propertyPath: String(item.propertyPath).trim(),
+          }))
+          .filter((item) => {
+            const usageNorm = path.normalize(item.file).replace(/\\/g, '/');
+            const sourceNorm = path.normalize(item.sourceFile).replace(/\\/g, '/');
+            return allKnownPathsSet.has(sourceNorm) && (usagePathsSet.has(usageNorm) || sourcePathsSet.has(usageNorm));
+          });
       }
     } catch {
       return [];
     }
 
-    return items.map((item) => ({
-      file: item.file,
-      line: item.line,
-      severity: 'error' as const,
-      message: item.message,
-      rule: 'logical-query-result-mismatch',
-    }));
+    const contentByFile = this.buildFileContentMap(sourceFilesPayload, usageFilesPayload);
+    let filteredItems = items.filter((item) =>
+      this.isLineWithPropertyAccess(item.file, item.line, contentByFile),
+    );
+    // Ложное срабатывание: связь подгружается в любом из связанных файлов (в т.ч. в верхней/вызывающей функции).
+    filteredItems = filteredItems.filter((item) =>
+      !this.isFalsePositiveRelationInAnyRelatedFile(item.message, contentByFile),
+    );
+    // Убираем только срабатывания, где доступ уже безопасен (?. или ??). Небезопасный доступ оставляем в отчёте.
+    filteredItems = filteredItems.filter((item) =>
+      !this.lineHasSafeAccessPattern(item.file, item.line, contentByFile),
+    );
+
+    const llmIssues = filteredItems.map((item) => {
+      const traceSuffix = ` [источник: ${item.sourceFile}:${item.sourceLine}, свойство: ${item.propertyPath}]`;
+      const messageWithTrace = item.message.includes(item.sourceFile) || item.message.includes(item.propertyPath)
+        ? item.message
+        : `${item.message}${traceSuffix}`;
+      return {
+        file: item.file,
+        line: item.line,
+        severity: 'error' as const,
+        message: messageWithTrace,
+        rule: 'logical-query-result-mismatch',
+      };
+    });
+    const mergedIssues: CodeIssueInterface[] = [...llmIssues, ...staticIssues];
+    const seenIssueKeys = new Set<string>();
+    const uniqueIssues: CodeIssueInterface[] = [];
+    for (const issue of mergedIssues) {
+      const issueKey = `${issue.file}:${issue.line}:${issue.message}`;
+      if (seenIssueKeys.has(issueKey)) {
+        continue;
+      }
+      seenIssueKeys.add(issueKey);
+      uniqueIssues.push(issue);
+    }
+
+    return uniqueIssues;
+  };
+
+  public generateTestCases = async (code: string): Promise<string[]> => {
+    const prompt = `
+Generate unit test case descriptions for this TypeScript code:
+${code}
+
+Return JSON array of strings, e.g. ["should do X", "should handle Y"].
+    `;
+
+    const llm = await this.getLlm();
+
+    const response = await llm.invoke(prompt);
+
+    const content = typeof response.content === 'string'
+      ? response.content
+      : JSON.stringify(response.content);
+
+    const parsed = JSON.parse(content) as unknown;
+
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item));
+    }
+
+    return [];
+  };
+
+  /**
+   * Краткое человеческое описание того, что изменил push,
+   * с учётом коммитов, diff'ов и найденных проблем/рекомендаций.
+   * При большом объёме изменений отправляет несколько запросов по батчам и объединяет результат.
+   */
+  public summarizePush = async (
+    commits: PushCommitSummaryInput[],
+    recommendations: AICodeIssueRecommendation[],
+    changes: ScmChangeInterface[],
+  ): Promise<string> => {
+    if (!commits.length) {
+      return '';
+    }
+
+    const llm = await this.getLlm();
+
+    const summaryChain = RunnableSequence.from([
+      this.pushSummaryPrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
+    const mergeChain = RunnableSequence.from([
+      this.mergeSummariesPrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
+
+    const commitsStr = JSON.stringify(commits);
+    const issuesStr = JSON.stringify(recommendations);
+    const overhead = commitsStr.length + issuesStr.length + 500;
+
+    const batches = this.buildSummaryBatches(changes, AIService.MAX_CHARS_PER_BATCH - overhead);
+
+    const summaries: string[] = [];
+
+    // не более 1 запроса в секунду к модели
+    for (let i = 0; i < batches.length; i += 1) {
+      if (i > 0) {
+        await this.rateLimitDelay();
+      }
+
+      const result = await summaryChain.invoke({
+        commits: commitsStr,
+        issues: issuesStr,
+        changes: JSON.stringify(batches[i]),
+      });
+
+      const text = typeof result === 'string' ? result.trim() : String(result);
+      if (text) {
+        summaries.push(text);
+      }
+    }
+
+    if (!summaries.length) {
+      return '';
+    }
+    if (summaries.length === 1) {
+      return summaries[0];
+    }
+
+    await this.rateLimitDelay();
+
+    const merged = await mergeChain.invoke({
+      summaries: summaries.map((summary, i) => `[Часть ${i + 1}]: ${summary}`).join('\n\n'),
+    });
+
+    return typeof merged === 'string' ? merged.trim() : String(merged);
   };
 
   /** Пытается загрузить baseUrl и paths из tsconfig.json в корне репозитория. */
@@ -444,22 +832,212 @@ export class AIService extends ModelBaseService {
     };
   };
 
+  /** Нормализует путь и убирает расширение для сравнения. */
+  private normalizePathWithoutExtension = (filePath: string): string =>
+    path.normalize(filePath).replace(/\\/g, '/').replace(/\.(tsx?|jsx?)$/i, '');
+
+  private buildFileContentMap = (
+    sourceFiles: Array<{ file: string; content: string }>,
+    usageFiles: Array<{ file: string; content: string }>,
+  ): Map<string, string> => {
+    const map = new Map<string, string>();
+    const add = (entry: { file: string; content: string }) => {
+      const key = path.normalize(entry.file).replace(/\\/g, '/');
+      map.set(key, entry.content);
+    };
+    sourceFiles.forEach(add);
+    usageFiles.forEach(add);
+    return map;
+  };
+
+  /** Нормализует номер строки из ответа модели: ожидается 1-based, первая строка = 1. */
+  private normalizeLineNumberOneBased = (value: unknown): number => {
+    const numberValue = Math.floor(Number(value));
+    if (!Number.isFinite(numberValue) || numberValue < 1) {
+      return 1;
+    }
+    return numberValue;
+  };
+
+  /**
+   * Строка содержит безопасный доступ: optional chaining (?.) или nullish coalescing (??) —
+   * такие срабатывания отфильтровываем как ложные (доступ уже безопасен).
+   */
+  private lineHasSafeAccessPattern = (
+    filePath: string,
+    lineOneBased: number,
+    contentByFile: Map<string, string>,
+  ): boolean => {
+    const content = contentByFile.get(path.normalize(filePath).replace(/\\/g, '/'));
+    if (!content) {
+      return false;
+    }
+    const lines = content.split('\n');
+    const lineIndex = lineOneBased - 1;
+    if (lineIndex < 0 || lineIndex >= lines.length) {
+      return false;
+    }
+    const line = lines[lineIndex];
+    return /\?\./.test(line) || /\?\?/.test(line);
+  };
+
+  /**
+   * Если в сообщении говорится о «незагруженной связи», но в любом из связанных файлов
+   * (в т.ч. в верхней/вызывающей функции) эта связь есть в relations/join/include —
+   * считаем срабатывание ложным и отфильтровываем.
+   */
+  private isFalsePositiveRelationInAnyRelatedFile = (
+    message: string,
+    contentByFile: Map<string, string>,
+  ): boolean => {
+    const relationKey = this.extractRelationKeyFromMessage(message);
+    if (!relationKey) {
+      return false;
+    }
+    for (const content of contentByFile.values()) {
+      if (this.fileContainsRelationInQuery(content, relationKey)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  /** Извлекает ключ связи из текста сообщения (например "order.delivery"). */
+  private extractRelationKeyFromMessage = (message: string): string | null => {
+    const withQuotes = message.match(/связи\s+['"]([^'"]+)['"]/i);
+    if (withQuotes?.[1]) {
+      const relation = withQuotes[1].trim();
+      if (relation.includes('.')) {
+        return relation;
+      }
+      const entityMatch = message.match(/сущности\s+(\w+)/i);
+      if (entityMatch?.[1]) {
+        return `${entityMatch[1].trim()}.${relation}`;
+      }
+      return relation;
+    }
+    const dotted = message.match(/(\w+(?:\.\w+)+)/g);
+    if (dotted?.length) {
+      const candidate = dotted.find((part) => /\.\w+$/.test(part) && message.includes(part));
+      return candidate ?? dotted[0] ?? null;
+    }
+    return null;
+  };
+
+  /** Проверяет, что в содержимом файла связь указана в relations/join (findOne, find, leftJoinAndSelect и т.д.). */
+  private fileContainsRelationInQuery = (content: string, relationKey: string): boolean => {
+    const quoted = content.includes(`'${relationKey}'`) || content.includes(`"${relationKey}"`);
+    if (!quoted) {
+      return false;
+    }
+    const hasFind = /\b(?:findOne|find)\s*\(\s*\{[\s\S]*?relations\s*:/i.test(content)
+      || /\b(?:leftJoinAndSelect|innerJoinAndSelect)\s*\(/i.test(content)
+      || /\b(?:include|select)\s*:\s*\{/i.test(content);
+    return hasFind;
+  };
+
+  /** Проверяет, что в указанной строке файла есть обращение к свойству (например obj.prop или obj?.prop). */
+  private isLineWithPropertyAccess = (
+    filePath: string,
+    lineOneBased: number,
+    contentByFile: Map<string, string>,
+  ): boolean => {
+    const content = contentByFile.get(path.normalize(filePath).replace(/\\/g, '/'));
+    if (!content) {
+      return true;
+    }
+    const lines = content.split('\n');
+    const lineIndex = lineOneBased - 1;
+    if (lineIndex < 0 || lineIndex >= lines.length) {
+      return false;
+    }
+    const line = lines[lineIndex];
+    return AIService.PROPERTY_ACCESS_LINE_PATTERN.test(line);
+  };
+
+  /**
+   * Собирает пути файлов, которые импортируют хотя бы один из изменённых файлов (места вызова).
+   */
+  private collectCallerFilePaths = async (
+    changedPathsWithoutExtension: string[],
+    getSourceFilePaths: () => Promise<string[]>,
+    getFileContent: GetFileContentFn,
+    pathResolver: (specifier: string, fromFile: string) => string | null,
+  ): Promise<string[]> => {
+    const changedSet = new Set(
+      changedPathsWithoutExtension.map((pathItem) => path.normalize(pathItem).replace(/\\/g, '/')),
+    );
+    const sourcePaths = await getSourceFilePaths();
+    const callerPaths: string[] = [];
+    const allowedExtensions = ['.ts', '.tsx'];
+
+    for (const fromPath of sourcePaths) {
+      const extension = fromPath.slice(fromPath.lastIndexOf('.')).toLowerCase();
+      if (!allowedExtensions.includes(extension)) {
+        continue;
+      }
+      let content: string;
+      try {
+        content = await getFileContent(fromPath);
+      } catch {
+        continue;
+      }
+      if (!content?.trim()) {
+        continue;
+      }
+      const sourceFile = ts.createSourceFile(
+        fromPath,
+        content,
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      const visit = (node: ts.Node): void => {
+        if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+          const specifier = node.moduleSpecifier.text;
+          if (specifier.includes('node_modules') || specifier.includes('README.md') || (specifier.length > 0 && !specifier.startsWith('.') && !specifier.startsWith('@') && !specifier.includes('/'))) {
+            return;
+          }
+          const resolved = pathResolver(specifier, fromPath);
+          if (resolved) {
+            const resolvedNormalized = this.normalizePathWithoutExtension(resolved);
+            if (changedSet.has(resolvedNormalized)) {
+              callerPaths.push(fromPath);
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+    }
+
+    return [...new Set(callerPaths)];
+  };
+
   /** Собирает пути файлов, импортируемых из изменённых (относительные и алиасы), без расширения. */
   private collectImportedPathsFromChanges = (
     changes: ScmChangeInterface[],
     pathResolver: (specifier: string, fromFile: string) => string | null,
   ): string[] => {
-    const allowedExtensions = ['.ts', '.tsx'];
+    const payload = changes
+      .filter((change) => {
+        const extension = change.file.slice(change.file.lastIndexOf('.')).toLowerCase();
+        return (extension === '.ts' || extension === '.tsx') && Boolean(change.newContent?.trim());
+      })
+      .map((change) => ({ file: change.file, content: change.newContent }));
+    return this.collectImportedPathsFromFiles(payload, pathResolver);
+  };
+
+  /** Собирает пути файлов, импортируемых из переданных файлов (относительные и алиасы), без расширения. */
+  private collectImportedPathsFromFiles = (
+    files: Array<{ file: string; content: string }>,
+    pathResolver: (specifier: string, fromFile: string) => string | null,
+  ): string[] => {
     const resultSet = new Set<string>();
 
-    for (const change of changes) {
-      const extension = change.file.slice(change.file.lastIndexOf('.')).toLowerCase();
-      if (!allowedExtensions.includes(extension) || !change.newContent?.trim()) {
-        continue;
-      }
+    for (const fileItem of files) {
       const sourceFile = ts.createSourceFile(
-        change.file,
-        change.newContent,
+        fileItem.file,
+        fileItem.content,
         ts.ScriptTarget.Latest,
         true,
       );
@@ -467,10 +1045,10 @@ export class AIService extends ModelBaseService {
       const visit = (node: ts.Node): void => {
         if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
           const specifier = node.moduleSpecifier.text;
-          if (specifier.includes('node_modules') || (specifier.length > 0 && !specifier.startsWith('.') && !specifier.startsWith('@') && !specifier.includes('/'))) {
+          if (specifier.includes('node_modules') || specifier.includes('README.md') || (specifier.length > 0 && !specifier.startsWith('.') && !specifier.startsWith('@') && !specifier.includes('/'))) {
             return;
           }
-          const resolved = pathResolver(specifier, change.file);
+          const resolved = pathResolver(specifier, fileItem.file);
           if (resolved) {
             resultSet.add(resolved);
           }
@@ -483,94 +1061,1056 @@ export class AIService extends ModelBaseService {
     return Array.from(resultSet);
   };
 
-  public generateTestCases = async (code: string): Promise<string[]> => {
-    const prompt = `
-Generate unit test case descriptions for this TypeScript code:
-${code}
+  private buildParameterPropertyAccessTargetKey = (target: {
+    filePath: string;
+    kind: ParameterPropertyAccessTarget['kind'];
+    name: string;
+    className?: string;
+  }): string => {
+    const normalizedFilePath = path.normalize(target.filePath).replace(/\\/g, '/');
+    const classNamePart = target.className ? `:${target.className}` : '';
+    return `${normalizedFilePath}:${target.kind}:${target.name}${classNamePart}`;
+  };
 
-Return JSON array of strings, e.g. ["should do X", "should handle Y"].
-    `;
+  private mergeUniqueStrings = (currentValues: string[], nextValues: string[]): string[] => {
+    const mergedSet = new Set<string>();
+    for (const value of currentValues) {
+      if (value?.trim()) {
+        mergedSet.add(value);
+      }
+    }
+    for (const value of nextValues) {
+      if (value?.trim()) {
+        mergedSet.add(value);
+      }
+    }
+    return Array.from(mergedSet);
+  };
 
-    const llm = await this.getLlm();
+  private mergePropertyAccessEntries = (
+    currentEntries: ParameterPropertyAccessEntry[],
+    nextEntries: ParameterPropertyAccessEntry[],
+  ): ParameterPropertyAccessEntry[] => {
+    const mergedEntries: ParameterPropertyAccessEntry[] = [];
+    const seenKeys = new Set<string>();
 
-    const response = await llm.invoke(prompt);
+    const addEntry = (entry: ParameterPropertyAccessEntry): void => {
+      const key = `${entry.parameterIndex}:${entry.propertyPath}:${entry.requiresExactRelation}:${entry.line}`;
+      if (seenKeys.has(key)) {
+        return;
+      }
+      seenKeys.add(key);
+      mergedEntries.push(entry);
+    };
 
-    const content = typeof response.content === 'string'
-      ? response.content
-      : JSON.stringify(response.content);
+    currentEntries.forEach(addEntry);
+    nextEntries.forEach(addEntry);
 
-    const parsed = JSON.parse(content) as unknown;
+    return mergedEntries;
+  };
 
-    if (Array.isArray(parsed)) {
-      return parsed.map((item) => String(item));
+  private collectParameterPropertyAccessTargetsFromChanges = (changes: ScmChangeInterface[]): ParameterPropertyAccessTarget[] => {
+    const allowedExtensions = ['.ts', '.tsx'];
+    const targetsByKey = new Map<string, ParameterPropertyAccessTarget>();
+
+    for (const change of changes) {
+      const extension = change.file.slice(change.file.lastIndexOf('.')).toLowerCase();
+      if (!allowedExtensions.includes(extension) || !change.newContent?.trim()) {
+        continue;
+      }
+      const targets = this.collectParameterPropertyAccessTargetsFromFile(change.file, change.newContent);
+      for (const target of targets) {
+        const existingTarget = targetsByKey.get(target.key);
+        if (!existingTarget) {
+          targetsByKey.set(target.key, target);
+          continue;
+        }
+        existingTarget.parameterNames = this.mergeUniqueStrings(
+          existingTarget.parameterNames,
+          target.parameterNames,
+        );
+        existingTarget.destructuredProperties = this.mergeUniqueStrings(
+          existingTarget.destructuredProperties,
+          target.destructuredProperties,
+        );
+        existingTarget.propertyAccesses = this.mergeUniqueStrings(
+          existingTarget.propertyAccesses,
+          target.propertyAccesses,
+        );
+        existingTarget.propertyAccessEntries = this.mergePropertyAccessEntries(
+          existingTarget.propertyAccessEntries,
+          target.propertyAccessEntries,
+        );
+      }
     }
 
+    return Array.from(targetsByKey.values());
+  };
+
+  private collectParameterPropertyAccessTargetsFromFile = (
+    filePath: string,
+    content: string,
+  ): ParameterPropertyAccessTarget[] => {
+    const sourceFile = ts.createSourceFile(
+      filePath,
+      content,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const targetsByKey = new Map<string, ParameterPropertyAccessTarget>();
+
+    type ParameterAlias = { parameterIndex: number; pathSegments: string[] };
+
+    const arrayMethodNames = new Set<string>([
+      'map',
+      'filter',
+      'find',
+      'findIndex',
+      'findLast',
+      'findLastIndex',
+      'forEach',
+      'reduce',
+      'reduceRight',
+      'some',
+      'every',
+      'flatMap',
+    ]);
+
+    const getLineNumberFromNode = (node: ts.Node): number => {
+      const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+      return line + 1;
+    };
+
+    const cloneAliasMap = (aliasMap: Map<string, ParameterAlias>): Map<string, ParameterAlias> => {
+      return new Map(
+        Array.from(aliasMap.entries()).map(([key, value]) => [
+          key,
+          { parameterIndex: value.parameterIndex, pathSegments: [...value.pathSegments] },
+        ]),
+      );
+    };
+
+    const unwrapExpression = (expression: ts.Expression): ts.Expression => {
+      if (ts.isParenthesizedExpression(expression)) {
+        return unwrapExpression(expression.expression);
+      }
+      if (ts.isAwaitExpression(expression)) {
+        return unwrapExpression(expression.expression);
+      }
+      if (ts.isNonNullExpression(expression)) {
+        return unwrapExpression(expression.expression);
+      }
+      if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+        return unwrapExpression(expression.expression);
+      }
+      return expression;
+    };
+
+    const extractExpressionSegments = (
+      expression: ts.Expression,
+    ): { baseName: string | null; segments: string[] } => {
+      const unwrappedExpression = unwrapExpression(expression);
+      if (ts.isIdentifier(unwrappedExpression)) {
+        return { baseName: unwrappedExpression.text, segments: [] };
+      }
+      if (ts.isPropertyAccessExpression(unwrappedExpression) || ts.isPropertyAccessChain(unwrappedExpression)) {
+        const parentResult = extractExpressionSegments(unwrappedExpression.expression);
+        if (!parentResult.baseName) {
+          return { baseName: null, segments: [] };
+        }
+        return {
+          baseName: parentResult.baseName,
+          segments: [...parentResult.segments, unwrappedExpression.name.text],
+        };
+      }
+      if (ts.isElementAccessExpression(unwrappedExpression)) {
+        const parentResult = extractExpressionSegments(unwrappedExpression.expression);
+        if (!parentResult.baseName) {
+          return { baseName: null, segments: [] };
+        }
+        if (ts.isStringLiteral(unwrappedExpression.argumentExpression) || ts.isNumericLiteral(unwrappedExpression.argumentExpression)) {
+          return {
+            baseName: parentResult.baseName,
+            segments: [...parentResult.segments, unwrappedExpression.argumentExpression.text],
+          };
+        }
+      }
+      return { baseName: null, segments: [] };
+    };
+
+    const resolveExpressionToAlias = (
+      expression: ts.Expression,
+      aliasMap: Map<string, ParameterAlias>,
+    ): { alias: ParameterAlias; propertySegments: string[] } | null => {
+      const result = extractExpressionSegments(expression);
+      if (!result.baseName) {
+        return null;
+      }
+      const alias = aliasMap.get(result.baseName);
+      if (!alias) {
+        return null;
+      }
+      return { alias, propertySegments: result.segments };
+    };
+
+    const addBindingAliases = (
+      bindingPattern: ts.ObjectBindingPattern,
+      baseAlias: ParameterAlias,
+      aliasMap: Map<string, ParameterAlias>,
+    ): void => {
+      for (const element of bindingPattern.elements) {
+        if (element.dotDotDotToken) {
+          continue;
+        }
+        const propertyNameNode = element.propertyName ?? element.name;
+        if (
+          !ts.isIdentifier(propertyNameNode)
+          && !ts.isStringLiteral(propertyNameNode)
+          && !ts.isNumericLiteral(propertyNameNode)
+          && !ts.isComputedPropertyName(propertyNameNode)
+        ) {
+          continue;
+        }
+        const propertyName = this.getPropertyNameText(propertyNameNode, sourceFile);
+        if (!propertyName) {
+          continue;
+        }
+        const nextAlias: ParameterAlias = {
+          parameterIndex: baseAlias.parameterIndex,
+          pathSegments: [...baseAlias.pathSegments, propertyName],
+        };
+        if (ts.isIdentifier(element.name)) {
+          aliasMap.set(element.name.text, nextAlias);
+        } else if (ts.isObjectBindingPattern(element.name)) {
+          addBindingAliases(element.name, nextAlias, aliasMap);
+        }
+      }
+    };
+
+    const collectAliasMapFromParameters = (
+      parameters: ts.NodeArray<ts.ParameterDeclaration>,
+    ): Map<string, ParameterAlias> => {
+      const aliasMap = new Map<string, ParameterAlias>();
+      parameters.forEach((parameter, parameterIndex) => {
+        if (ts.isIdentifier(parameter.name)) {
+          aliasMap.set(parameter.name.text, { parameterIndex, pathSegments: [] });
+        } else if (ts.isObjectBindingPattern(parameter.name)) {
+          addBindingAliases(parameter.name, { parameterIndex, pathSegments: [] }, aliasMap);
+        }
+      });
+      return aliasMap;
+    };
+
+    const applyAliasFromVariableDeclaration = (
+      declaration: ts.VariableDeclaration,
+      aliasMap: Map<string, ParameterAlias>,
+    ): void => {
+      if (!declaration.initializer) {
+        return;
+      }
+      const resolved = resolveExpressionToAlias(declaration.initializer, aliasMap);
+      if (!resolved) {
+        return;
+      }
+      const nextAlias: ParameterAlias = {
+        parameterIndex: resolved.alias.parameterIndex,
+        pathSegments: [...resolved.alias.pathSegments, ...resolved.propertySegments],
+      };
+      if (ts.isIdentifier(declaration.name)) {
+        aliasMap.set(declaration.name.text, nextAlias);
+      } else if (ts.isObjectBindingPattern(declaration.name)) {
+        addBindingAliases(declaration.name, nextAlias, aliasMap);
+      }
+    };
+
+    const recordPropertyAccessEntry = (
+      alias: ParameterAlias,
+      propertySegments: string[],
+      requiresExactRelation: boolean,
+      node: ts.Node,
+      entries: ParameterPropertyAccessEntry[],
+      entryKeys: Set<string>,
+    ): void => {
+      const pathSegments = [...alias.pathSegments, ...propertySegments];
+      if (pathSegments.length === 0) {
+        return;
+      }
+      const propertyPath = pathSegments.join('.');
+      const line = getLineNumberFromNode(node);
+      const key = `${alias.parameterIndex}:${propertyPath}:${requiresExactRelation}:${line}`;
+      if (entryKeys.has(key)) {
+        return;
+      }
+      entryKeys.add(key);
+      entries.push({
+        parameterIndex: alias.parameterIndex,
+        propertyPath,
+        requiresExactRelation,
+        line,
+      });
+    };
+
+    const recordArrayUsageAccess = (
+      expression: ts.Expression,
+      aliasMap: Map<string, ParameterAlias>,
+      entries: ParameterPropertyAccessEntry[],
+      entryKeys: Set<string>,
+    ): void => {
+      const resolved = resolveExpressionToAlias(expression, aliasMap);
+      if (!resolved) {
+        return;
+      }
+      recordPropertyAccessEntry(
+        resolved.alias,
+        resolved.propertySegments,
+        true,
+        expression,
+        entries,
+        entryKeys,
+      );
+    };
+
+    const recordTarget = (target: ParameterPropertyAccessTarget): void => {
+      const existingTarget = targetsByKey.get(target.key);
+      if (!existingTarget) {
+        targetsByKey.set(target.key, target);
+        return;
+      }
+      existingTarget.parameterNames = this.mergeUniqueStrings(
+        existingTarget.parameterNames,
+        target.parameterNames,
+      );
+      existingTarget.destructuredProperties = this.mergeUniqueStrings(
+        existingTarget.destructuredProperties,
+        target.destructuredProperties,
+      );
+      existingTarget.propertyAccesses = this.mergeUniqueStrings(
+        existingTarget.propertyAccesses,
+        target.propertyAccesses,
+      );
+      existingTarget.propertyAccessEntries = this.mergePropertyAccessEntries(
+        existingTarget.propertyAccessEntries,
+        target.propertyAccessEntries,
+      );
+    };
+
+    const handleFunctionLike = (
+      functionLikeNode: ts.FunctionLikeDeclarationBase,
+      functionName: string,
+      kind: ParameterPropertyAccessTarget['kind'],
+      className?: string,
+    ): void => {
+      const parameterInfo = this.collectFunctionParameterInfo(functionLikeNode.parameters, sourceFile);
+      const parameterNames = parameterInfo.parameterNames;
+      const destructuredProperties = parameterInfo.destructuredProperties;
+      if (functionLikeNode.parameters.length === 0) {
+        return;
+      }
+      const parameterNamesByIndex = functionLikeNode.parameters.map((parameter, parameterIndex) => {
+        if (ts.isIdentifier(parameter.name)) {
+          return parameter.name.text;
+        }
+        return `param${parameterIndex + 1}`;
+      });
+
+      const propertyAccessEntries: ParameterPropertyAccessEntry[] = [];
+      const propertyAccessEntryKeys = new Set<string>();
+      const aliasMap = collectAliasMapFromParameters(functionLikeNode.parameters);
+
+      const visitNode = (node: ts.Node, currentAliasMap: Map<string, ParameterAlias>): void => {
+        if (ts.isFunctionLike(node) && node !== functionLikeNode) {
+          return;
+        }
+
+        if (ts.isVariableDeclaration(node)) {
+          applyAliasFromVariableDeclaration(node, currentAliasMap);
+        }
+
+        if (ts.isCallExpression(node)) {
+          const callExpressionTarget = node.expression;
+          if (ts.isPropertyAccessExpression(callExpressionTarget) || ts.isPropertyAccessChain(callExpressionTarget)) {
+            const methodName = callExpressionTarget.name.text;
+            if (arrayMethodNames.has(methodName)) {
+              recordArrayUsageAccess(callExpressionTarget.expression, currentAliasMap, propertyAccessEntries, propertyAccessEntryKeys);
+              const callback = node.arguments[0];
+              if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
+                const resolved = resolveExpressionToAlias(callExpressionTarget.expression, currentAliasMap);
+                if (resolved) {
+                  const callbackAliasMap = cloneAliasMap(currentAliasMap);
+                  const baseAlias: ParameterAlias = {
+                    parameterIndex: resolved.alias.parameterIndex,
+                    pathSegments: [...resolved.alias.pathSegments, ...resolved.propertySegments],
+                  };
+                  const callbackParameter = callback.parameters[0];
+                  if (callbackParameter) {
+                    if (ts.isIdentifier(callbackParameter.name)) {
+                      callbackAliasMap.set(callbackParameter.name.text, baseAlias);
+                    } else if (ts.isObjectBindingPattern(callbackParameter.name)) {
+                      addBindingAliases(callbackParameter.name, baseAlias, callbackAliasMap);
+                    }
+                  }
+                  if (callback.body) {
+                    if (ts.isBlock(callback.body)) {
+                      callback.body.statements.forEach((statement) => visitNode(statement, callbackAliasMap));
+                    } else {
+                      visitNode(callback.body, callbackAliasMap);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (ts.isPropertyAccessExpression(node) || ts.isPropertyAccessChain(node)) {
+          const isCallExpressionTarget = ts.isCallExpression(node.parent) && node.parent.expression === node;
+          if (!isCallExpressionTarget) {
+            if (node.name.text === 'length') {
+              recordArrayUsageAccess(node.expression, currentAliasMap, propertyAccessEntries, propertyAccessEntryKeys);
+            } else {
+              const resolved = resolveExpressionToAlias(node, currentAliasMap);
+              if (resolved) {
+                recordPropertyAccessEntry(
+                  resolved.alias,
+                  resolved.propertySegments,
+                  false,
+                  node,
+                  propertyAccessEntries,
+                  propertyAccessEntryKeys,
+                );
+              }
+            }
+          }
+        }
+
+        if (ts.isElementAccessExpression(node)) {
+          recordArrayUsageAccess(node.expression, currentAliasMap, propertyAccessEntries, propertyAccessEntryKeys);
+        }
+
+        ts.forEachChild(node, (child) => visitNode(child, currentAliasMap));
+      };
+
+      if (functionLikeNode.body) {
+        visitNode(functionLikeNode.body, aliasMap);
+      }
+
+      if (propertyAccessEntries.length === 0 && destructuredProperties.length === 0) {
+        return;
+      }
+
+      const propertyAccesses = propertyAccessEntries.map((entry) => {
+        const parameterName = parameterNamesByIndex[entry.parameterIndex] ?? `param${entry.parameterIndex + 1}`;
+        return `${parameterName}.${entry.propertyPath}`;
+      });
+
+      const target: ParameterPropertyAccessTarget = {
+        key: this.buildParameterPropertyAccessTargetKey({
+          filePath,
+          kind,
+          name: functionName,
+          className,
+        }),
+        kind,
+        name: functionName,
+        className,
+        filePath,
+        parameterNames,
+        destructuredProperties,
+        propertyAccesses,
+        propertyAccessEntries,
+      };
+
+      recordTarget(target);
+    };
+
+    const visitNode = (node: ts.Node): void => {
+      if (ts.isFunctionDeclaration(node) && node.name) {
+        handleFunctionLike(node, node.name.text, 'function');
+      }
+
+      if (ts.isVariableStatement(node)) {
+        for (const declaration of node.declarationList.declarations) {
+          if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+            continue;
+          }
+          if (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer)) {
+            handleFunctionLike(declaration.initializer, declaration.name.text, 'function');
+          }
+        }
+      }
+
+      if (ts.isClassDeclaration(node) && node.name) {
+        const className = node.name.text;
+        for (const member of node.members) {
+          if (ts.isMethodDeclaration(member) && member.name) {
+            const methodName = this.getPropertyNameText(member.name, sourceFile);
+            if (methodName) {
+              handleFunctionLike(member, methodName, 'method', className);
+            }
+            continue;
+          }
+          if (
+            ts.isPropertyDeclaration(member)
+            && member.name
+            && member.initializer
+            && (ts.isArrowFunction(member.initializer) || ts.isFunctionExpression(member.initializer))
+          ) {
+            const methodName = this.getPropertyNameText(member.name, sourceFile);
+            if (methodName) {
+              handleFunctionLike(member.initializer, methodName, 'method', className);
+            }
+          }
+        }
+      }
+
+      ts.forEachChild(node, visitNode);
+    };
+
+    visitNode(sourceFile);
+
+    return Array.from(targetsByKey.values());
+  };
+
+  private collectFunctionParameterInfo = (
+    parameters: ts.NodeArray<ts.ParameterDeclaration>,
+    sourceFile: ts.SourceFile,
+  ): { parameterNames: string[]; destructuredProperties: string[] } => {
+    const parameterNames: string[] = [];
+    const destructuredProperties: string[] = [];
+
+    for (const parameter of parameters) {
+      const parameterName = parameter.name;
+      if (ts.isIdentifier(parameterName)) {
+        parameterNames.push(parameterName.text);
+        continue;
+      }
+      if (ts.isObjectBindingPattern(parameterName)) {
+        const propertyNames = this.collectDestructuredPropertyNames(parameterName, sourceFile);
+        destructuredProperties.push(...propertyNames);
+      }
+    }
+
+    return { parameterNames, destructuredProperties };
+  };
+
+  private collectDestructuredPropertyNames = (
+    bindingPattern: ts.ObjectBindingPattern,
+    sourceFile: ts.SourceFile,
+  ): string[] => {
+    const propertyNames: string[] = [];
+
+    for (const element of bindingPattern.elements) {
+      const propertyNameNode = element.propertyName ?? element.name;
+      if (ts.isIdentifier(propertyNameNode) || ts.isStringLiteral(propertyNameNode) || ts.isNumericLiteral(propertyNameNode)) {
+        propertyNames.push(propertyNameNode.text);
+      } else if (ts.isComputedPropertyName(propertyNameNode)) {
+        propertyNames.push(propertyNameNode.expression.getText(sourceFile));
+      }
+      if (ts.isObjectBindingPattern(element.name)) {
+        propertyNames.push(...this.collectDestructuredPropertyNames(element.name, sourceFile));
+      }
+    }
+
+    return propertyNames;
+  };
+
+  private getRootIdentifierName = (expression: ts.Expression): string | null => {
+    if (ts.isIdentifier(expression)) {
+      return expression.text;
+    }
+    if (ts.isPropertyAccessExpression(expression) || ts.isPropertyAccessChain(expression)) {
+      return this.getRootIdentifierName(expression.expression);
+    }
+    if (ts.isElementAccessExpression(expression)) {
+      return this.getRootIdentifierName(expression.expression);
+    }
+    if (ts.isNonNullExpression(expression)) {
+      return this.getRootIdentifierName(expression.expression);
+    }
+    if (ts.isParenthesizedExpression(expression)) {
+      return this.getRootIdentifierName(expression.expression);
+    }
+    if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+      return this.getRootIdentifierName(expression.expression);
+    }
+    return null;
+  };
+
+  private getPropertyNameText = (name: ts.PropertyName, sourceFile: ts.SourceFile): string | null => {
+    if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+      return name.text;
+    }
+    if (ts.isComputedPropertyName(name)) {
+      const computedText = name.expression.getText(sourceFile).trim();
+      return computedText || null;
+    }
+    return null;
+  };
+
+  private hasAnyTargetNameInContent = (content: string, targetNames: string[]): boolean => {
+    for (const targetName of targetNames) {
+      if (targetName && content.includes(targetName)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  private collectRelationSourcesFromFile = (filePath: string, content: string): QueryRelationSource[] => {
+    const sourceFile = ts.createSourceFile(
+      filePath,
+      content,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const relationSources: QueryRelationSource[] = [];
+
+    const extractCallExpression = (expression: ts.Expression): ts.CallExpression | null => {
+      if (ts.isAwaitExpression(expression)) {
+        return extractCallExpression(expression.expression);
+      }
+      if (ts.isParenthesizedExpression(expression)) {
+        return extractCallExpression(expression.expression);
+      }
+      if (ts.isCallExpression(expression)) {
+        return expression;
+      }
+      return null;
+    };
+
+    const visitNode = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && node.initializer && ts.isIdentifier(node.name)) {
+        const callExpression = extractCallExpression(node.initializer);
+        if (callExpression) {
+          const relationPaths = this.extractRelationPathsFromCallExpression(callExpression, sourceFile);
+          if (relationPaths.length > 0) {
+            relationSources.push({
+              filePath,
+              variableName: node.name.text,
+              relationPaths,
+              sourceText: callExpression.expression.getText(sourceFile),
+            });
+          }
+        }
+      }
+
+      ts.forEachChild(node, visitNode);
+    };
+
+    visitNode(sourceFile);
+
+    return relationSources;
+  };
+
+  private extractRelationPathsFromCallExpression = (
+    callExpression: ts.CallExpression,
+    sourceFile: ts.SourceFile,
+  ): string[] => {
+    const callTarget = callExpression.expression;
+    const methodName = (ts.isPropertyAccessExpression(callTarget) || ts.isPropertyAccessChain(callTarget))
+      ? callTarget.name.text
+      : null;
+    if (!methodName || ![
+      'find',
+      'findOne',
+      'findBy',
+      'findOneBy',
+      'findOneOrFail',
+      'findAndCount',
+      'findUnique',
+      'findMany',
+      'findFirst',
+      'findFirstOrThrow',
+    ].includes(methodName)) {
+      return [];
+    }
+
+    const relationPaths: string[] = [];
+    for (const argument of callExpression.arguments) {
+      if (!ts.isObjectLiteralExpression(argument)) {
+        continue;
+      }
+      for (const property of argument.properties) {
+        if (!ts.isPropertyAssignment(property)) {
+          continue;
+        }
+        const propertyName = this.getPropertyNameText(property.name, sourceFile);
+        if (!propertyName || !['relations', 'include', 'select'].includes(propertyName)) {
+          continue;
+        }
+        relationPaths.push(...this.collectRelationPathsFromInitializer(property.initializer, sourceFile));
+      }
+    }
+
+    return this.mergeUniqueStrings([], relationPaths);
+  };
+
+  private collectRelationPathsFromInitializer = (
+    initializer: ts.Expression,
+    sourceFile: ts.SourceFile,
+  ): string[] => {
+    if (ts.isArrayLiteralExpression(initializer)) {
+      return initializer.elements
+        .filter((element): element is ts.StringLiteral => ts.isStringLiteral(element))
+        .map((element) => element.text)
+        .filter((value) => value?.trim());
+    }
+    if (ts.isObjectLiteralExpression(initializer)) {
+      return this.collectRelationPathsFromObjectLiteral(initializer, sourceFile, '');
+    }
     return [];
   };
 
-  /**
-   * Краткое человеческое описание того, что изменил push,
-   * с учётом коммитов, diff'ов и найденных проблем/рекомендаций.
-   * При большом объёме изменений отправляет несколько запросов по батчам и объединяет результат.
-   */
-  public summarizePush = async (commits: PushCommitSummaryInput[], recommendations: AICodeIssueRecommendation[], changes: ScmChangeInterface[]): Promise<string> => {
-    if (!commits.length) {
-      return '';
+  private collectRelationPathsFromObjectLiteral = (
+    objectLiteral: ts.ObjectLiteralExpression,
+    sourceFile: ts.SourceFile,
+    prefix: string,
+  ): string[] => {
+    const relationPaths: string[] = [];
+    for (const property of objectLiteral.properties) {
+      if (!ts.isPropertyAssignment(property)) {
+        continue;
+      }
+      const propertyName = this.getPropertyNameText(property.name, sourceFile);
+      if (!propertyName) {
+        continue;
+      }
+      const nextPrefix = prefix ? `${prefix}.${propertyName}` : propertyName;
+      if (ts.isObjectLiteralExpression(property.initializer)) {
+        relationPaths.push(...this.collectRelationPathsFromObjectLiteral(property.initializer, sourceFile, nextPrefix));
+        continue;
+      }
+      if (property.initializer.kind === ts.SyntaxKind.TrueKeyword) {
+        relationPaths.push(nextPrefix);
+      }
+    }
+    return relationPaths;
+  };
+
+  private buildRelationSourcesByVariableName = (relationSources: QueryRelationSource[]): Map<string, QueryRelationSource> => {
+    const relationSourcesByVariableName = new Map<string, QueryRelationSource>();
+    for (const relationSource of relationSources) {
+      const existingSource = relationSourcesByVariableName.get(relationSource.variableName);
+      if (!existingSource) {
+        relationSourcesByVariableName.set(relationSource.variableName, relationSource);
+        continue;
+      }
+      existingSource.relationPaths = this.mergeUniqueStrings(
+        existingSource.relationPaths,
+        relationSource.relationPaths,
+      );
+      if (!existingSource.sourceText) {
+        existingSource.sourceText = relationSource.sourceText;
+      }
+    }
+    return relationSourcesByVariableName;
+  };
+
+  private collectCallSiteFilePaths = async (
+    targets: ParameterPropertyAccessTarget[],
+    getSourceFilePaths: () => Promise<string[]>,
+    getFileContent: GetFileContentFn,
+  ): Promise<{
+    callSiteFilesByTargetKey: Map<string, Set<string>>;
+    callSiteFiles: Set<string>;
+    callSitesByTargetKey: Map<string, CallSiteTraceInfo[]>;
+  }> => {
+    const allowedExtensions = ['.ts', '.tsx'];
+    const functionTargetsByName = new Map<string, ParameterPropertyAccessTarget[]>();
+    const methodTargetsByName = new Map<string, ParameterPropertyAccessTarget[]>();
+    const classNameSet = new Set<string>();
+
+    for (const target of targets) {
+      if (target.kind === 'function') {
+        const list = functionTargetsByName.get(target.name) ?? [];
+        list.push(target);
+        functionTargetsByName.set(target.name, list);
+      } else {
+        const list = methodTargetsByName.get(target.name) ?? [];
+        list.push(target);
+        methodTargetsByName.set(target.name, list);
+        if (target.className) {
+          classNameSet.add(target.className);
+        }
+      }
     }
 
-    const llm = await this.getLlm();
+    const targetNameList = Array.from(new Set([
+      ...functionTargetsByName.keys(),
+      ...methodTargetsByName.keys(),
+    ]));
+    const classNameList = Array.from(classNameSet);
 
-    const summaryChain = RunnableSequence.from([
-      this.pushSummaryPrompt,
-      llm,
-      new StringOutputParser(),
-    ]);
-    const mergeChain = RunnableSequence.from([
-      this.mergeSummariesPrompt,
-      llm,
-      new StringOutputParser(),
-    ]);
+    const callSiteFilesByTargetKey = new Map<string, Set<string>>();
+    const callSiteFiles = new Set<string>();
+    const callSitesByTargetKey = new Map<string, CallSiteTraceInfo[]>();
 
-    const commitsStr = JSON.stringify(commits);
-    const issuesStr = JSON.stringify(recommendations);
-    const overhead = commitsStr.length + issuesStr.length + 500;
-
-    const batches = this.buildSummaryBatches(changes, AIService.MAX_CHARS_PER_BATCH - overhead);
-
-    const summaries: string[] = [];
-
-    // не более 1 запроса в секунду к модели
-    for (let i = 0; i < batches.length; i += 1) {
-      if (i > 0) {
-        await this.rateLimitDelay();
-      }
-
-      const result = await summaryChain.invoke({
-        commits: commitsStr,
-        issues: issuesStr,
-        changes: JSON.stringify(batches[i]),
+    const recordCallSite = (
+      target: ParameterPropertyAccessTarget,
+      filePath: string,
+      calleeText: string,
+      callArguments: CallSiteArgumentInfo[],
+    ): void => {
+      callSiteFiles.add(filePath);
+      const existingSet = callSiteFilesByTargetKey.get(target.key) ?? new Set<string>();
+      existingSet.add(filePath);
+      callSiteFilesByTargetKey.set(target.key, existingSet);
+      const existingCallSites = callSitesByTargetKey.get(target.key) ?? [];
+      existingCallSites.push({
+        file: filePath,
+        callee: calleeText,
+        arguments: callArguments,
       });
+      callSitesByTargetKey.set(target.key, existingCallSites);
+    };
 
-      const text = typeof result === 'string' ? result.trim() : String(result);
-      if (text) {
-        summaries.push(text);
+    const sourcePaths = await getSourceFilePaths();
+
+    for (const filePath of sourcePaths) {
+      const extension = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
+      if (!allowedExtensions.includes(extension)) {
+        continue;
+      }
+
+      let content: string;
+      try {
+        content = await getFileContent(filePath);
+      } catch {
+        continue;
+      }
+
+      if (!content?.trim()) {
+        continue;
+      }
+
+      if (!this.hasAnyTargetNameInContent(content, targetNameList)) {
+        continue;
+      }
+
+      const classNamesInFile = new Set<string>();
+      for (const className of classNameList) {
+        if (content.includes(className)) {
+          classNamesInFile.add(className);
+        }
+      }
+
+      const sourceFile = ts.createSourceFile(
+        filePath,
+        content,
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      const relationSourcesByVariableName = this.buildRelationSourcesByVariableName(
+        this.collectRelationSourcesFromFile(filePath, content),
+      );
+
+      const buildCallSiteArguments = (callExpression: ts.CallExpression): CallSiteArgumentInfo[] => {
+        const callArguments: CallSiteArgumentInfo[] = [];
+        for (let argumentIndex = 0; argumentIndex < callExpression.arguments.length; argumentIndex += 1) {
+          const argument = callExpression.arguments[argumentIndex];
+          if (!ts.isIdentifier(argument)) {
+            continue;
+          }
+          const relationSource = relationSourcesByVariableName.get(argument.text);
+          if (!relationSource) {
+            continue;
+          }
+          callArguments.push({
+            index: argumentIndex,
+            name: argument.text,
+            relationPaths: relationSource.relationPaths,
+            sourceText: relationSource.sourceText,
+          });
+        }
+        return callArguments;
+      };
+
+      const visitNode = (node: ts.Node, currentClassName?: string): void => {
+        if (ts.isClassDeclaration(node) && node.name) {
+          const nextClassName = node.name.text;
+          ts.forEachChild(node, (child) => visitNode(child, nextClassName));
+          return;
+        }
+
+        if (ts.isCallExpression(node)) {
+          const callExpressionTarget = node.expression;
+          const calleeText = callExpressionTarget.getText(sourceFile);
+          const callArguments = buildCallSiteArguments(node);
+          if (ts.isIdentifier(callExpressionTarget)) {
+            const functionTargets = functionTargetsByName.get(callExpressionTarget.text);
+            if (functionTargets) {
+              for (const target of functionTargets) {
+                recordCallSite(target, filePath, calleeText, callArguments);
+              }
+            }
+          } else if (ts.isPropertyAccessExpression(callExpressionTarget) || ts.isPropertyAccessChain(callExpressionTarget)) {
+            const methodName = callExpressionTarget.name.text;
+            const methodTargets = methodTargetsByName.get(methodName);
+            if (methodTargets) {
+              const objectExpression = callExpressionTarget.expression;
+              if (ts.isIdentifier(objectExpression)) {
+                const identifierName = objectExpression.text;
+                for (const target of methodTargets) {
+                  if (target.className && target.className === identifierName) {
+                    recordCallSite(target, filePath, calleeText, callArguments);
+                  } else if (target.className && classNamesInFile.has(target.className)) {
+                    recordCallSite(target, filePath, calleeText, callArguments);
+                  } else if (!target.className) {
+                    recordCallSite(target, filePath, calleeText, callArguments);
+                  }
+                }
+              } else if (objectExpression.kind === ts.SyntaxKind.ThisKeyword) {
+                for (const target of methodTargets) {
+                  if (target.className && target.className === currentClassName) {
+                    recordCallSite(target, filePath, calleeText, callArguments);
+                  }
+                }
+              } else {
+                for (const target of methodTargets) {
+                  if (!target.className || classNamesInFile.has(target.className)) {
+                    recordCallSite(target, filePath, calleeText, callArguments);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        ts.forEachChild(node, (child) => visitNode(child, currentClassName));
+      };
+
+      visitNode(sourceFile);
+    }
+
+    return { callSiteFilesByTargetKey, callSiteFiles, callSitesByTargetKey };
+  };
+
+  private buildTraceabilityPayload = (
+    targets: ParameterPropertyAccessTarget[],
+    callSiteFilesByTargetKey: Map<string, Set<string>>,
+    callSitesByTargetKey: Map<string, CallSiteTraceInfo[]>,
+  ): TraceabilityPayloadItem[] => {
+    return targets.map((target) => {
+      const callSiteFiles = Array.from(callSiteFilesByTargetKey.get(target.key) ?? []).sort();
+      const callSites = callSitesByTargetKey.get(target.key) ?? [];
+      const targetName = target.kind === 'method' && target.className
+        ? `${target.className}.${target.name}`
+        : target.name;
+      return {
+        target: targetName,
+        definitionFile: target.filePath,
+        parameterNames: [...target.parameterNames].sort(),
+        destructuredProperties: [...target.destructuredProperties].sort(),
+        propertyAccesses: target.propertyAccesses.slice(0, 10),
+        callSiteFiles,
+        callSites,
+        propertyAccessEntries: target.propertyAccessEntries.slice(0, 20),
+      };
+    });
+  };
+
+  private findMissingRelationPath = (
+    propertyPath: string,
+    relationPaths: string[],
+    requiresExactRelation: boolean,
+  ): string | null => {
+    const trimmedPropertyPath = propertyPath.trim();
+    if (!trimmedPropertyPath) {
+      return null;
+    }
+    const propertySegments = trimmedPropertyPath.split('.').filter((segment) => segment);
+    if (propertySegments.length <= 1) {
+      return null;
+    }
+
+    const hasRelation = (candidatePath: string): boolean => {
+      return relationPaths.some((relationPath) =>
+        relationPath === candidatePath || relationPath.startsWith(`${candidatePath}.`),
+      );
+    };
+
+    const prefixPaths = propertySegments
+      .slice(0, -1)
+      .map((_, index) => propertySegments.slice(0, index + 1).join('.'));
+
+    for (const prefixPath of prefixPaths) {
+      if (!hasRelation(prefixPath)) {
+        return prefixPath;
       }
     }
 
-    if (!summaries.length) {
-      return '';
-    }
-    if (summaries.length === 1) {
-      return summaries[0];
+    if (requiresExactRelation && !hasRelation(trimmedPropertyPath)) {
+      return trimmedPropertyPath;
     }
 
-    await this.rateLimitDelay();
+    return null;
+  };
 
-    const merged = await mergeChain.invoke({
-      summaries: summaries.map((summary, i) => `[Часть ${i + 1}]: ${summary}`).join('\n\n'),
-    });
+  private buildStaticRelationIssues = (
+    targets: ParameterPropertyAccessTarget[],
+    callSitesByTargetKey: Map<string, CallSiteTraceInfo[]>,
+  ): CodeIssueInterface[] => {
+    const issues: CodeIssueInterface[] = [];
+    const issueKeys = new Set<string>();
 
-    return typeof merged === 'string' ? merged.trim() : String(merged);
+    for (const target of targets) {
+      if (!target.propertyAccessEntries.length) {
+        continue;
+      }
+      const callSites = callSitesByTargetKey.get(target.key) ?? [];
+      if (!callSites.length) {
+        continue;
+      }
+      for (const entry of target.propertyAccessEntries) {
+        const relevantCallSites = callSites
+          .map((callSite) => {
+            const argumentInfo = callSite.arguments.find((argument) => argument.index === entry.parameterIndex);
+            return argumentInfo ? { callSite, argumentInfo } : null;
+          })
+          .filter(
+            (item): item is { callSite: CallSiteTraceInfo; argumentInfo: CallSiteArgumentInfo } =>
+              Boolean(item?.argumentInfo?.relationPaths?.length),
+          );
+
+        if (!relevantCallSites.length) {
+          continue;
+        }
+
+        const missingCallSites = relevantCallSites
+          .map(({ callSite, argumentInfo }) => {
+            const missingPath = this.findMissingRelationPath(
+              entry.propertyPath,
+              argumentInfo.relationPaths,
+              entry.requiresExactRelation,
+            );
+            return missingPath ? { callSite, missingPath } : null;
+          })
+          .filter((item): item is { callSite: CallSiteTraceInfo; missingPath: string } => Boolean(item));
+
+        if (!missingCallSites.length) {
+          continue;
+        }
+
+        const uniqueCallSiteFiles = Array.from(new Set(missingCallSites.map((item) => item.callSite.file)));
+        const callSiteFilesText = uniqueCallSiteFiles.slice(0, 3).join(', ');
+        const missingRelationPath = missingCallSites[0].missingPath;
+        const message = `Свойство "${entry.propertyPath}" может быть не загружено: в вызовах ${callSiteFilesText} отсутствует связь "${missingRelationPath}".`;
+        const issueKey = `${target.filePath}:${entry.line}:${message}`;
+        if (issueKeys.has(issueKey)) {
+          continue;
+        }
+        issueKeys.add(issueKey);
+        issues.push({
+          file: target.filePath,
+          line: entry.line,
+          severity: 'error',
+          message,
+          rule: 'logical-query-result-mismatch',
+        });
+      }
+    }
+
+    return issues;
   };
 
   private getLlm = async () => this.getChatModel();
