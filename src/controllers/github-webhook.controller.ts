@@ -4,7 +4,6 @@ import type { Request, Response } from 'express';
 import type { PushEvent, PullRequestEvent } from '@octokit/webhooks-types';
 
 import { BaseService } from '@/services/core/base.service';
-import { AffectedFilesService } from '@/services/analysis/affected-files.service';
 import { GithubAgent } from '@/services/scm/agents/github-agent.service';
 import { ScmReviewService } from '@/services/scm/scm-review.service';
 import { ScmNotificationService } from '@/services/scm/scm-notification.service';
@@ -17,8 +16,6 @@ type GithubPullRequestEvent = PullRequestEvent;
 @Singleton
 export class GithubWebhookController extends BaseService {
   protected override readonly TAG: string = 'GithubWebhookController';
-
-  private readonly affectedFilesService = Container.get(AffectedFilesService);
 
   private readonly githubAgent = Container.get(GithubAgent);
 
@@ -188,92 +185,40 @@ export class GithubWebhookController extends BaseService {
 
     this.loggerService.info(this.TAG, `Processing GitHub pull_request: repo=${repositoryName}, PR #${pullRequestNumber}, author=${author}`);
 
-    let analysisSummary = '';
-    let humanSummary = '';
-    let processedFilesCount: number | undefined;
-    let processedFilePaths: string[] | undefined;
-
-    try {
-      const changes = await this.githubAgent.getPullRequestChanges(
-        repositoryOwner,
-        event.repository.name,
-        pullRequestNumber,
-      );
-
-      let mergedChanges = changes;
-      const ref = event.pull_request.head.sha;
-
-      if (process.env.IMPACT_ANALYSIS_ENABLED !== 'false' && changes.length > 0) {
-        try {
-          const changedPaths = changes.map((change) => change.file);
-          const affectedPaths = await this.affectedFilesService.getAffectedPaths(
-            changedPaths,
-            {
-              getSourceFilePaths: () => this.githubAgent.getRepositorySourceFilePaths(
-                repositoryOwner,
-                event.repository.name,
-                ref,
-                { maxFiles: 200 },
-              ),
-              getFileContent: (filePath) => this.githubAgent.getFileContentAtRef(
-                repositoryOwner,
-                event.repository.name,
-                filePath,
-                ref,
-              ),
-            },
-            { affectedFileLimit: 50 },
-          );
-
-          const changedSet = new Set(changedPaths);
-          const pathsToFetch = affectedPaths.filter((filePath) => !changedSet.has(filePath));
-
-          if (pathsToFetch.length > 0) {
-            const affectedChanges = await this.githubAgent.getFilesSnapshot(
-              repositoryOwner,
-              event.repository.name,
-              ref,
-              pathsToFetch,
-            );
-            mergedChanges = [...changes, ...affectedChanges];
-          }
-        } catch (error) {
-          this.loggerService.warn(this.TAG, 'Impact analysis failed for PR, analyzing only changed files', error);
-        }
-      }
-
-      mergedChanges = mergedChanges.filter(
-        (change) => !ScmReviewService.isMarkdownFile(change.file),
-      );
-      const getFileContent = (filePath: string) => this.githubAgent.getFileContentAtRef(
-        repositoryOwner,
-        event.repository.name,
-        filePath,
-        ref,
-      );
-      const getSourceFilePaths = () => this.githubAgent.getRepositorySourceFilePaths(
-        repositoryOwner,
-        event.repository.name,
-        ref,
-        { maxFiles: 200 },
-      );
-      const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
-        mergedChanges,
-        [],
-        '<b>Результаты анализа кода по Pull Request</b>',
-        { getFileContent, getSourceFilePaths },
-      );
-
-      analysisSummary = analysisResult.analysisSummary;
-      humanSummary = analysisResult.humanSummary;
-      processedFilesCount = mergedChanges.length;
-      processedFilePaths = mergedChanges.map((change) => change.file);
-    } catch (error) {
-      const errorInstance = error as Error;
-      this.loggerService.error(this.TAG, 'Failed to analyze code for GitHub pull_request event', errorInstance);
-
-      analysisSummary = this.scmReviewService.buildAnalysisErrorSummary(error);
-    }
+    const ref = event.pull_request.head.sha;
+    const pushResult = await this.scmPushAnalysisService.run({
+      driver: {
+        getInitialChanges: () => this.githubAgent.getPullRequestChanges(
+          repositoryOwner,
+          event.repository.name,
+          pullRequestNumber,
+        ),
+        getSnapshot: (paths) => this.githubAgent.getFilesSnapshot(
+          repositoryOwner,
+          event.repository.name,
+          ref,
+          paths,
+        ),
+        getAffectedPathsInput: () => ({
+          getSourceFilePaths: () => this.githubAgent.getRepositorySourceFilePaths(
+            repositoryOwner,
+            event.repository.name,
+            ref,
+            { maxFiles: 200 },
+          ),
+          getFileContent: (filePath) => this.githubAgent.getFileContentAtRef(
+            repositoryOwner,
+            event.repository.name,
+            filePath,
+            ref,
+          ),
+        }),
+      },
+      changedPaths: [], // будут получены из getInitialChanges внутри run
+      commits: [],
+      summaryTitle: '<b>Результаты анализа кода по Pull Request</b>',
+      errorContext: 'Failed to analyze code for GitHub pull_request event',
+    });
 
     const text = this.scmNotificationService.buildPullRequestNotificationText({
       providerName: 'GitHub',
@@ -282,10 +227,10 @@ export class GithubWebhookController extends BaseService {
       pullRequestTitle: this.scmReviewService.escapeHtml(pullRequestTitle),
       pullRequestUrl: this.scmReviewService.escapeHtml(pullRequestUrl),
       author: this.scmReviewService.escapeHtml(author),
-      humanSummary: this.scmReviewService.escapeHtml(humanSummary),
-      analysisSummary,
-      processedFilesCount,
-      processedFilePaths,
+      humanSummary: this.scmReviewService.escapeHtml(pushResult.humanSummary),
+      analysisSummary: pushResult.analysisSummary,
+      processedFilesCount: pushResult.processedFilesCount,
+      processedFilePaths: pushResult.processedFilePaths,
     });
 
     await this.telegramService.sendAdminMessage(text, { parse_mode: 'HTML' });

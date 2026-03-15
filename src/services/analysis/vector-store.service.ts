@@ -66,14 +66,10 @@ export class VectorStoreService extends ModelBaseService {
     this.loggerService.info(this.TAG, `Indexing ${changes.length} file changes for embeddings`);
 
     // Разбиваем большие файлы на чанки, чтобы не превышать лимит токенов модели.
-    // README.md и прочие .md не индексируем.
+    // Ожидается, что вызывающий код передаёт уже отфильтрованный список (без .md) — фильтрация в ScmReviewService.
     const items: { file: string; content: string; }[] = [];
 
     for (const change of changes) {
-      const filePathLower = change.file.toLowerCase().replace(/\\/g, '/');
-      if (filePathLower.endsWith('.md')) {
-        continue;
-      }
       const normalized = this.normalizeContent(change.newContent);
       const chunks = this.chunkContent(normalized);
 

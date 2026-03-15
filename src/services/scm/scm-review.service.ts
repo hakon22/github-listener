@@ -80,7 +80,9 @@ export class ScmReviewService {
     await this.vectorStoreService.indexMergeRequestChanges(analyzableChanges);
 
     const analysis = await this.analyzerService.analyzeChanges(analyzableChanges);
-    const logicalDataIssues = await this.aiService.getLogicalDataLoadingIssues(analyzableChanges, options);
+    const logicalDataIssues = process.env.USE_UNIFIED_AI_ANALYSIS === 'true'
+      ? await this.aiService.getUnifiedAnalysisIssues(analyzableChanges)
+      : await this.aiService.getLogicalDataLoadingIssues(analyzableChanges, options);
     const allIssues = [...analysis, ...logicalDataIssues];
     return this.aiService.getRecommendations(allIssues);
   };

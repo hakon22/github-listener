@@ -1,8 +1,6 @@
 import { createRequire } from 'node:module';
 import * as path from 'path';
-import { Container, Singleton } from 'typescript-ioc';
-import { SecurityAnalyzerService } from '@/services/analysis/security-analyzer.service';
-import { PerformanceAnalyzerService } from '@/services/analysis/performance-analyzer.service';
+import { Singleton } from 'typescript-ioc';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 import { ESLint } from 'eslint';
@@ -93,10 +91,6 @@ type FunctionSignatureMetaInterface = {
 export class CodeAnalyzerService {
   private readonly eslint: ESLint;
 
-  private readonly securityAnalyzer = Container.get(SecurityAnalyzerService);
-
-  private readonly performanceAnalyzer = Container.get(PerformanceAnalyzerService);
-
   public constructor() {
     const tsRecommendedConfigs = tsPluginRaw.flatConfigs['flat/recommended'];
     const baseConfig = [
@@ -116,8 +110,10 @@ export class CodeAnalyzerService {
       const fileIssues = await this.analyzeFile(change.file, change.newContent);
       issues.push(...fileIssues);
 
-      const logicalIssues = this.extractLogicalChangeCandidates(change);
-      issues.push(...logicalIssues);
+      if (process.env.LOGICAL_CHANGE_EXTRACTION_ENABLED !== 'false') {
+        const logicalIssues = this.extractLogicalChangeCandidates(change);
+        issues.push(...logicalIssues);
+      }
     }
 
     return issues;
@@ -134,13 +130,6 @@ export class CodeAnalyzerService {
       '.js',
       '.jsx',
     ].includes(extension);
-
-    // Security и performance для всех файлов, в т.ч. .html
-    const securityIssues = this.securityAnalyzer.analyze(content, filePath);
-    issues.push(...securityIssues);
-
-    const perfIssues = this.performanceAnalyzer.analyze(content, filePath);
-    issues.push(...perfIssues);
 
     if (!isAllowedFileExtension) {
       return issues;

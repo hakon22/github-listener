@@ -40,12 +40,16 @@ export class ScmPushAnalysisService {
   private readonly scmReviewService = Container.get(ScmReviewService);
 
   public run = async (options: RunPushAnalysisOptions): Promise<RunPushAnalysisResult> => {
-    const { driver, changedPaths, commits, summaryTitle, errorContext } = options;
-
-    this.loggerService.info(this.TAG, `Starting push analysis: ${changedPaths.length} changed paths, ${commits.length} commits`);
+    const { driver, changedPaths: changedPathsOption, commits, summaryTitle, errorContext } = options;
 
     try {
       const changes = await driver.getInitialChanges();
+      const changedPaths = changedPathsOption.length > 0
+        ? changedPathsOption
+        : changes.map((change) => change.file);
+
+      this.loggerService.info(this.TAG, `Starting push analysis: ${changedPaths.length} changed paths, ${commits.length} commits`);
+
       let mergedChanges = changes;
 
       if (process.env.IMPACT_ANALYSIS_ENABLED !== 'false') {
@@ -68,10 +72,7 @@ export class ScmPushAnalysisService {
         }
       }
 
-      mergedChanges = mergedChanges.filter(
-        (change) => !ScmReviewService.isMarkdownFile(change.file),
-      );
-
+      // Фильтрация по типу файла (только .md) выполняется в ScmReviewService — единая точка входа.
       const affectedInput = driver.getAffectedPathsInput();
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
@@ -84,7 +85,10 @@ export class ScmPushAnalysisService {
       );
 
       const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
-      const processedFilePaths = mergedChanges.map((change) => change.file);
+      const analyzableChanges = mergedChanges.filter(
+        (change) => !ScmReviewService.isMarkdownFile(change.file),
+      );
+      const processedFilePaths = analyzableChanges.map((change) => change.file);
 
       this.loggerService.info(this.TAG, 'Push analysis completed successfully');
 

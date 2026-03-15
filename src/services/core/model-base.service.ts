@@ -16,6 +16,7 @@ export abstract class ModelBaseService extends BaseService {
       configuration: {
         baseURL,
       },
+      temperature: 0.2,
       model,
     });
   };

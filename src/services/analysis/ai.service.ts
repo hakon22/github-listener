@@ -111,6 +111,8 @@ export class AIService extends ModelBaseService {
 
   private readonly mergeSummariesPrompt: PromptTemplate;
 
+  private readonly unifiedAnalysisPrompt: PromptTemplate;
+
   /** Контекст модели 262K токенов; ≈4 символа на токен. Резерв под ответ и системный промпт ~50K токенов → ~848K символов на батч. */
   private static readonly MAX_CHARS_PER_BATCH = 848000;
 
@@ -122,6 +124,12 @@ export class AIService extends ModelBaseService {
 
   /** Минимальный интервал между запросами к модели (не более 1 запроса в секунду). */
   private static readonly MIN_REQUEST_INTERVAL_MS = 1000;
+
+  /** Максимум символов контекста для единого AI-анализа изменений. */
+  private static readonly UNIFIED_ANALYSIS_MAX_CHARS = 400000;
+
+  /** Максимум issue, для которых выполняется векторный поиск похожего кода в getRecommendations. */
+  private static readonly MAX_ISSUES_FOR_VECTOR_SEARCH = 15;
 
   /** Строка содержит обращение к свойству (obj.prop или obj?.prop). */
   private static readonly PROPERTY_ACCESS_LINE_PATTERN = /\.\s*\w|\?\s*\.\s*\w|\{\s*[^}]*\}\s*=|\(\s*\{[^)]*\}\s*\)/;
@@ -224,16 +232,19 @@ export class AIService extends ModelBaseService {
       
       УЧЁТ ТИПИЗАЦИИ (TypeScript):
       - Смотри на объявления типов в коде: interface, type, типы параметров и возвращаемых значений.
-      - Свойство с модификатором optional (prop?: Type) в типе объекта — по контракту может быть undefined. Доступ к такому свойству без проверки — стилистический риск, но НЕ ошибка «свойство не загружено». Такую проблему НЕ сообщай.
-      - Сообщай проблему только если свойство в типе объявлено как обязательное (prop: Type, без ?), а в источнике данных (relations/include/select/запрос) оно не загружается — тогда в рантайме возможен undefined вопреки типу.
-      - Если тип сущности взят из ORM/Prisma (entity, model), учитывай: поля связей часто опциональны в типах (relation?: Entity[]), пока связь не загружена. Для таких полей без загрузки в запросе проблему не сообщай.
-      - Итог: опциональное в типе (?) — не сообщай; обязательное в типе, но не загружается в источнике — сообщай.
+      - ОБЯЗАТЕЛЬНЫЕ СВОЙСТВА (prop: Type, без ?): если свойство в типе объявлено как обязательное (не опциональное), НЕ сообщай проблему «свойство может быть не загружено» — контракт типа предполагает, что оно всегда есть; не предупреждай об возможной ошибке для таких полей.
+      - ОПЦИОНАЛЬНЫЕ (prop?: Type): доступ без проверки — стилистический риск, но НЕ ошибка «свойство не загружено». Такую проблему НЕ сообщай.
+      - ВЛОЖЕННЫЕ СВОЙСТВА (например order.delivery.address): это правило НЕ касается вложенных частей объекта, которые могут быть не загружены в БД (relations, вложенные сущности). Для вложенных свойств проверку «загружено ли в запросе» делай как раньше: если relation/вложенный объект не подгружен в relations/include/select — сообщай проблему, даже если во вложенном типе поле объявлено обязательным.
+      - ВНЕШНИЕ ТИПЫ (node_modules): если тип объекта или свойство объявлено типом из внешней библиотеки (импорт из node_modules или путь/спецификатор содержит node_modules), пропусти проверку этого объекта — не сообщай проблемы для его свойств.
+      - Итог: обязательное в типе (без ?) на верхнем уровне — не сообщай; вложенные свойства (могут не подгружаться из БД) — проверяй; типы из node_modules — не проверяй.
       
-      КОД СЧИТАЕТСЯ БЕЗОПАСНЫМ — НЕ СООБЩАЙ ПРОБЛЕМУ, ТОЛЬКО ЕСЛИ ВИДИШЬ:
+      КОД СЧИТАЕТСЯ БЕЗОПАСНЫМ — НЕ СООБЩАЙ ПРОБЛЕМУ, ЕСЛИ ВИДИШЬ:
       - В строке использования есть optional chaining (?.), nullish coalescing (??), деструктуризация с умолчанием или явная проверка на undefined/null — тогда доступ уже защищён.
       - Объект загружен с нужными полями в любом из связанных файлов или в callSites (relationPaths покрывают propertyPath).
       - Свойство в типе объекта объявлено как опциональное (prop?: Type).
-      Иначе: если загрузки свойства нет ни в цепочке вызовов, ни в связанных файлах, и в коде обращение без ?./??/проверки — ОБЯЗАТЕЛЬНО сообщи проблему (риск runtime-ошибки).
+      - Свойство объявлено как обязательное (prop: Type, без ?) на верхнем уровне объекта — не предупреждай об возможной ошибке.
+      - Тип объекта или свойство объявлено типом из node_modules — проверку для этого объекта не делай.
+      Для ВЛОЖЕННЫХ свойств (цепочка через relation/вложенный объект из БД): если загрузки нет в relations/include/select и в коде обращение без ?./??/проверки — сообщи проблему (риск runtime-ошибки).
       
       ОСОБЫЕ ПРАВИЛА ДЛЯ ORM:
       - relations/include/select/join = загрузка. Загружено в верхней функции или в callSite — считай, что объект пришёл уже с полем.
@@ -296,6 +307,29 @@ export class AIService extends ModelBaseService {
       Задача: объедини их в один связный текст из 3-5 предложений по-русски. Сохрани все важные факты, убери повторы.
       Без Markdown и списков — только простой текст. Пиши ТОЛЬКО по-русски.
     `);
+
+    this.unifiedAnalysisPrompt = PromptTemplate.fromTemplate(`
+      Ты — Senior-разработчик, проводишь код-ревью изменений в TypeScript/Node.js проекте.
+      
+      Тебе передан список изменённых файлов с содержимым (newContent) и диффом (diff).
+      Изменения (JSON-массив объектов с полями "file", "newContent", "diff"):
+      {changes}
+      
+      Задача: найди проблемы в коде, которые могут привести к багам, уязвимостям или поломке в проде.
+      Проверь:
+      - Безопасность: eval, небезопасные вызовы (execSync), XSS-риски (.innerHTML и т.п.).
+      - Производительность: тяжёлые операции в циклах, console.log в продакшн-коде.
+      - Загрузка данных: обращение к полям/связям объектов, которые не загружаются в запросе (relations, include, select). При этом: (1) если свойство в типе объявлено обязательным (без ?) — не сообщай проблему; (2) вложенные свойства (например relation.field), которые могут быть не загружены в БД, проверяй и при отсутствии загрузки — сообщай; (3) типы из node_modules не проверяй.
+      - Контракты: изменение схем сущностей или сигнатур функций без обновления вызывающего кода.
+      
+      Верни JSON-массив проблем СТРОГО в формате:
+      [
+        {{ "file": "путь/к/файлу", "line": number, "severity": "error"|"warning"|"info", "message": "описание", "rule": "краткий_идентификатор", "suggestion": "как исправить" }}
+      ]
+      Пиши message и suggestion по-русски. rule — латиницей (например security-eval, performance-console, data-loading-relation).
+      Если проблем нет — верни пустой массив [].
+      Выведи ТОЛЬКО JSON-массив, без markdown и лишнего текста.
+    `);
   }
 
   public getRecommendations = async (issues: CodeIssueInterface[]): Promise<AICodeIssueRecommendation[]> => {
@@ -311,11 +345,11 @@ export class AIService extends ModelBaseService {
       new StringOutputParser(),
     ]);
 
-    // Для каждого issue ищем похожий код в текущем MR
+    // Векторный поиск только для ограниченного числа issue, чтобы не перегружать пайплайн.
     const projectPatterns: { file: string; score: number; snippet: string; }[][] = [];
+    const issuesToEnrich = Math.min(issues.length, AIService.MAX_ISSUES_FOR_VECTOR_SEARCH);
 
-    // последовательные запросы к векторному хранилищу с контролируемым интервалом
-    for (let issueIndex = 0; issueIndex < issues.length; issueIndex += 1) {
+    for (let issueIndex = 0; issueIndex < issuesToEnrich; issueIndex += 1) {
       if (issueIndex > 0) {
         await this.rateLimitDelay();
       }
@@ -334,6 +368,10 @@ export class AIService extends ModelBaseService {
       }));
 
       projectPatterns.push(mappedSimilarCodeList);
+    }
+
+    for (let index = issuesToEnrich; index < issues.length; index += 1) {
+      projectPatterns.push([]);
     }
 
     const result = await chain.invoke({
@@ -371,6 +409,85 @@ export class AIService extends ModelBaseService {
         // preserve rule and file/line from original issue
       };
     });
+  };
+
+  /**
+   * Единый AI-анализ изменений: один запрос к модели с контекстом изменённых файлов.
+   * Возвращает список проблем (безопасность, производительность, загрузка данных, контракты).
+   * Включать через USE_UNIFIED_AI_ANALYSIS=true как альтернативу getLogicalDataLoadingIssues.
+   */
+  public getUnifiedAnalysisIssues = async (
+    changes: ScmChangeInterface[],
+  ): Promise<CodeIssueInterface[]> => {
+    if (!changes.length) {
+      return [];
+    }
+
+    let totalChars = 0;
+    const payload: Array<{ file: string; newContent: string; diff: string }> = [];
+    const maxPerFile = Math.floor(AIService.UNIFIED_ANALYSIS_MAX_CHARS / Math.max(changes.length, 1));
+
+    for (const change of changes) {
+      if (totalChars >= AIService.UNIFIED_ANALYSIS_MAX_CHARS) {
+        break;
+      }
+      const newContent = (change.newContent ?? '').slice(0, maxPerFile);
+      const diffMaxLen = Math.max(0, maxPerFile - newContent.length);
+      const diff = (change.diff ?? '').slice(0, Math.min(2000, diffMaxLen));
+      const slice = newContent.length + diff.length;
+      if (slice === 0) {
+        continue;
+      }
+      totalChars += slice;
+      payload.push({
+        file: change.file,
+        newContent,
+        diff,
+      });
+    }
+
+    if (!payload.length) {
+      return [];
+    }
+
+    const llm = await this.getLlm();
+    const chain = RunnableSequence.from([
+      this.unifiedAnalysisPrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
+
+    const result = await chain.invoke({
+      changes: JSON.stringify(payload),
+    });
+
+    try {
+      const jsonText = this.extractJsonPayload(result);
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed
+        .filter(
+          (item): item is { file: string; line: unknown; severity: string; message: string; rule?: string; suggestion?: string } =>
+            typeof item === 'object' &&
+            item !== null &&
+            'file' in item &&
+            'line' in item &&
+            'severity' in item &&
+            'message' in item,
+        )
+        .map((item) => ({
+          file: item.file,
+          line: typeof item.line === 'number' ? item.line : 1,
+          severity: (['error', 'warning', 'info'].includes(item.severity) ? item.severity : 'info') as CodeIssueInterface['severity'],
+          message: item.message,
+          rule: typeof item.rule === 'string' ? item.rule : 'unified-ai',
+          suggestion: typeof item.suggestion === 'string' ? item.suggestion : undefined,
+        }));
+    } catch {
+      return [];
+    }
   };
 
   /**
@@ -471,6 +588,7 @@ export class AIService extends ModelBaseService {
       }
 
       const importedPaths = this.collectImportedPathsFromChanges(changes, pathResolver);
+      const resolvedImportExtensions = ['.ts', '.tsx', '.d.ts'];
       for (const resolvedPathBase of importedPaths) {
         if (totalChars >= maxTotalChars) {
           break;
@@ -480,7 +598,7 @@ export class AIService extends ModelBaseService {
         }
         let content: string | null = null;
         let resolvedWithExt = '';
-        for (const ext of ['.ts', '.tsx']) {
+        for (const ext of resolvedImportExtensions) {
           const candidate = resolvedPathBase + ext;
           const normalized = path.normalize(candidate).replace(/\\/g, '/');
           if (seenPaths.has(normalized)) {
@@ -538,7 +656,7 @@ export class AIService extends ModelBaseService {
         if (resolvedPathBase.includes('node_modules')) {
           continue;
         }
-        for (const ext of ['.ts', '.tsx']) {
+        for (const ext of resolvedImportExtensions) {
           const candidate = resolvedPathBase + ext;
           const normalized = path.normalize(candidate).replace(/\\/g, '/');
           if (seenPaths.has(normalized)) {
@@ -680,31 +798,6 @@ export class AIService extends ModelBaseService {
     }
 
     return uniqueIssues;
-  };
-
-  public generateTestCases = async (code: string): Promise<string[]> => {
-    const prompt = `
-Generate unit test case descriptions for this TypeScript code:
-${code}
-
-Return JSON array of strings, e.g. ["should do X", "should handle Y"].
-    `;
-
-    const llm = await this.getLlm();
-
-    const response = await llm.invoke(prompt);
-
-    const content = typeof response.content === 'string'
-      ? response.content
-      : JSON.stringify(response.content);
-
-    const parsed = JSON.parse(content) as unknown;
-
-    if (Array.isArray(parsed)) {
-      return parsed.map((item) => String(item));
-    }
-
-    return [];
   };
 
   /**
