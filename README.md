@@ -66,9 +66,10 @@ const baseConfig = [
 - **Node.js**, **TypeScript**
 - **Express** — HTTP‑сервер (`src/main.ts`)
 - **Telegraf** — Telegram Bot API
-- **LangChain + OpenAI** — LLM и эмбеддинги
-- **typescript-ioc** — IoC‑контейнер
+- **LangChain + @langchain/openai** — LLM и эмбеддинги
+- **typescript-ioc** — IoC‑контейнер (reflect-metadata)
 - **winston** — логирование в файлы с ротацией
+- **Jest** — тесты
 - Docker / docker-compose для деплоя
 
 ---
@@ -96,6 +97,10 @@ const baseConfig = [
   - `GITHUB_SECRET` — secret GitHub API.
 - **Анализ кода**
   - `IMPACT_ANALYSIS_ENABLED` — при значении `false` отключается поиск и анализ затронутых файлов (по умолчанию включено).
+  - `LOGICAL_CHANGE_EXTRACTION_ENABLED` — при значении `false` отключается извлечение и проверка логических изменений (сигнатуры, загрузка данных через ИИ) (по умолчанию включено).
+  - `USE_UNIFIED_AI_ANALYSIS` — при значении `true` для поиска проблем загрузки данных используется единый унифицированный AI‑анализ вместо отдельного вызова.
+- **Прочее**
+  - `APP_NAME` — имя приложения в логах и уведомлениях об ошибках (по умолчанию `app`).
 - **AI‑модели (через LangChain)**
   - `OPENAI_API_KEY` - API ключ модели
   - `OPENAI_BASE_URL` - Base url модели
@@ -109,11 +114,12 @@ const baseConfig = [
 ## Скрипты npm
 
 - `npm run build` — компиляция TypeScript в `dist` (tsc + tsc-alias).
-- `npm run start:bot:dev` — запуск сервиса в dev‑режиме (`NODE_ENV=development`, `tsx src/main.ts`).
-- `npm run start:bot:prod` — запуск собранного сервиса (production, `node dist/main.js`).
-- `npm run start:bot:docker:dev` — запуск внутри контейнера в dev‑режиме (`IS_DOCKER=TRUE`, `NODE_ENV=development`).
-- `npm run start:bot:docker:prod` — запуск внутри контейнера в production‑режиме (`IS_DOCKER=TRUE`, `NODE_ENV=production`).
+- `npm run start:app:dev` — запуск сервиса в dev‑режиме (`NODE_ENV=development`, `tsx src/main.ts`).
+- `npm run start:app:prod` — запуск собранного сервиса (production, `node dist/main.js`). Перед запуском выполните `npm run build`.
+- `npm run start:app:docker:dev` — запуск внутри контейнера в dev‑режиме (`IS_DOCKER=TRUE`, `NODE_ENV=development`).
+- `npm run start:app:docker:prod` — запуск внутри контейнера в production‑режиме (`IS_DOCKER=TRUE`, `NODE_ENV=production`).
 - `npm run lint` — проверка кода ESLint по `src`; автоисправление: `npm run lint -- --fix`.
+- `npm run test` — запуск тестов Jest.
 
 ---
 
@@ -130,7 +136,7 @@ npm ci
 3. Запустить в режиме разработки:
 
 ```bash
-npm run start:bot:dev
+npm run start:app:dev
 ```
 
 Сервис поднимет HTTP‑сервер на `http://localhost:3013`.
@@ -167,7 +173,7 @@ docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.dev.yml up -d
 ```
 
-Образ собирается из `Dockerfile.dev` (сборка в образе, в контейнере запускается `start:bot:docker:dev`). Порт **3013**, логи — в указанный каталог на хосте (в примере `C:/srv/logs`).
+Образ собирается из `Dockerfile.dev` (сборка в образе, в контейнере запускается `start:app:docker:dev`). Порт **3013**, логи — в указанный каталог на хосте (в примере `C:/srv/logs`).
 
 ---
 
