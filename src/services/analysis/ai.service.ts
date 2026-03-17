@@ -16,6 +16,8 @@ export interface LogicalDataLoadingOptions {
   getFileContent?: GetFileContentFn;
   /** Список путей исходных файлов репозитория для поиска файлов, которые импортируют изменённые (места вызова). */
   getSourceFilePaths?: () => Promise<string[]>;
+  /** Для анализа использования сущностей: список путей с увеличенным лимитом (по умолчанию используется getSourceFilePaths, часто ограниченный 200 файлами). */
+  getSourceFilePathsForEntityUsage?: () => Promise<string[]>;
 }
 
 interface TsconfigPathsInterface {
@@ -43,6 +45,22 @@ interface PushCommitSummaryInput {
   id: string;
   message: string;
   files: string[];
+}
+
+interface LogicalEntityChangeDetailsInterface {
+  kind: 'entity-schema-change';
+  entityName: string;
+  file: string;
+  addedProperties: Array<{
+    name: string;
+    type: string;
+    decorators: string[];
+  }>;
+  removedProperties: Array<{
+    name: string;
+    type: string;
+    decorators: string[];
+  }>;
 }
 
 interface SummaryChangeItem {
@@ -114,6 +132,8 @@ export class AIService extends ModelBaseService {
   private readonly mergeSummariesPrompt: PromptTemplate;
 
   private readonly unifiedAnalysisPrompt: PromptTemplate;
+
+  private readonly entitySchemaChangePrompt: PromptTemplate;
 
   /** Контекст модели 262K токенов; ≈4 символа на токен. Резерв под ответ и системный промпт ~50K токенов → ~848K символов на батч. */
   private static readonly MAX_CHARS_PER_BATCH = 848000;
@@ -341,6 +361,58 @@ export class AIService extends ModelBaseService {
       Если критических проблем нет — верни пустой массив [].
       Выведи ТОЛЬКО JSON-массив, без markdown и лишнего текста.
     `);
+
+    this.entitySchemaChangePrompt = PromptTemplate.fromTemplate(`
+      Ты — ведущий backend-разработчик на TypeScript/Node.js, специалист по ORM (TypeORM, Prisma и т.п.).
+
+      Тебе переданы:
+      1) Детали изменения схемы сущности (entityChange).
+      2) Набор файлов проекта, где используется эта сущность или её поля (files).
+
+      entityChange (JSON):
+      {entityChange}
+
+      files (JSON-массив объектов с полями "file", "content"):
+      {files}
+
+      ВАЖНО: содержимое каждого файла в "content" уже содержит пронумерованные строки исходного файла в формате "N: код_строки",
+      где N — номер строки, начиная с 1. Когда возвращаешь поле "line" в ответе — используй ИМЕННО этот номер N из префикса "N:".
+      Не придумывай номера строк сам, всегда опирайся на префикс.
+
+      Сущность изменилась (например, добавлены новые поля или связи). Твоя задача — найти РЕАЛЬНЫЕ места, где это изменение может привести к ошибке в рантайме или некорректным данным.
+
+      ИЩИ, В ЧЁМ ОПАСНОСТЬ:
+      - Создание/сохранение сущности (new, create, save, insert, update), где новые обязательные поля не заполняются.
+      - Маппинг сущности в DTO/ответы API, где новое поле явно ожидается (есть в типе/интерфейсе ответа), но не заполняется при маппинге.
+      - Использование полей сущности в бизнес-логике, где новый атрибут должен участвовать (например, при привязке/отвязке бота — обнулять оба поля), но код обновляет только часть полей.
+      - Жёстко захардкоженные списки полей в update/insert, где логика требует обнуления или установки нового поля (например, при блокировке бота — обнулить и telegramId, и telegramUsername).
+
+      НЕ ОТМЕЧАЙ КАК ПРОБЛЕМУ:
+      - «Добавьте поле в select/findOne» в файлах, где это поле нигде не читается, не возвращается в ответе и не входит в тип/интерфейс. Если в файле нет обращения к новому полю и контракт ответа его не требует — проблему не сообщай.
+      - Места, где новое поле просто не используется — это нормально.
+      - Стиль кода, форматирование, нейминг, мелкие best practices без риска падения.
+
+      ВАЖНО:
+      - Для каждой найденной проблемы укажи точный файл и номер строки (line — 1-based, по префиксу "N:").
+      - line должен ссылаться на строку, где проявляется проблема (создание/сохранение/использование сущности), а не на импорт или пустую строку.
+
+      Формат ответа — JSON-массив объектов СТРОГО такого вида:
+      [
+        {{
+          "file": "путь/к/файлу.ts",
+          "line": 123,
+          "severity": "error",
+          "message": "Краткое описание проблемы по-русски (что именно не учёл разработчик после изменения схемы).",
+          "rule": "logical-entity-usage",
+          "suggestion": "Краткая рекомендация, как исправить (по-русски)."
+        }}
+      ]
+
+      Пиши ТОЛЬКО по-русски в message и suggestion.
+      severity всегда "error".
+      Если критических проблем нет — верни пустой массив [].
+      Не используй Markdown и текст вне JSON.
+    `);
   }
 
   public getRecommendations = async (issues: CodeIssueInterface[]): Promise<AICodeIssueRecommendation[]> => {
@@ -433,9 +505,7 @@ export class AIService extends ModelBaseService {
    * Возвращает список проблем (безопасность, производительность, загрузка данных, контракты).
    * Включать через USE_UNIFIED_AI_ANALYSIS=true как альтернативу getLogicalDataLoadingIssues.
    */
-  public getUnifiedAnalysisIssues = async (
-    changes: ScmChangeInterface[],
-  ): Promise<CodeIssueInterface[]> => {
+  public getUnifiedAnalysisIssues = async (changes: ScmChangeInterface[]): Promise<CodeIssueInterface[]> => {
     if (!changes.length) {
       return [];
     }
@@ -2362,5 +2432,189 @@ export class AIService extends ModelBaseService {
 
     // 3. В крайнем случае вернём как есть — JSON.parse выбросит ошибку, которую мы выше перехватим
     return raw.trim();
+  };
+
+  /**
+   * Собирает файлы, где используется изменённая сущность: по импортам (кто импортирует файл сущности)
+   * и сам файл сущности. При отсутствии найденных по импортам — fallback по подстроке (имя сущности, новые поля).
+   */
+  private collectEntityUsageFiles = async (
+    entityChange: LogicalEntityChangeDetailsInterface,
+    options: LogicalDataLoadingOptions,
+  ): Promise<Array<{ file: string; content: string }>> => {
+    const getFileContent = options.getFileContent;
+    const getPaths = options.getSourceFilePathsForEntityUsage ?? options.getSourceFilePaths;
+    const result: Array<{ file: string; content: string }> = [];
+
+    if (!getFileContent || !getPaths) {
+      return result;
+    }
+
+    const allPaths = await getPaths();
+    const allowedExtensions = ['.ts', '.tsx'];
+    const maxTotalChars = AIService.LOGICAL_DATA_LOADING_MAX_CHARS;
+    const maxCharsPerFile = AIService.LOGICAL_DATA_LOADING_MAX_CHARS_PER_FILE;
+    let pathsToLoad: string[];
+
+    const tsconfigPaths = await this.loadTsconfigPaths(getFileContent);
+    const pathResolver = this.buildPathResolver(tsconfigPaths);
+    const entityPathWithoutExtension = this.normalizePathWithoutExtension(entityChange.file);
+
+    const callerPaths = await this.collectCallerFilePaths(
+      [entityPathWithoutExtension],
+      getPaths,
+      getFileContent,
+      pathResolver,
+    );
+
+    if (callerPaths.length > 0) {
+      pathsToLoad = [...new Set([entityChange.file, ...callerPaths])];
+    } else {
+      const normalizedEntityName = entityChange.entityName;
+      const addedPropertyNames = new Set(entityChange.addedProperties.map((property) => property.name).filter(Boolean));
+      const fallbackPaths: string[] = [entityChange.file];
+
+      for (const filePath of allPaths) {
+        const extension = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
+        if (!allowedExtensions.includes(extension)) {
+          continue;
+        }
+        let content: string;
+        try {
+          content = await getFileContent(filePath);
+        } catch {
+          continue;
+        }
+        if (!content?.trim()) {
+          continue;
+        }
+        const lowerContent = content.toLowerCase();
+        const hasEntityName = lowerContent.includes(normalizedEntityName.toLowerCase());
+        const hasAnyNewProperty = Array.from(addedPropertyNames).some((propertyName) =>
+          propertyName && lowerContent.includes(propertyName.toLowerCase()),
+        );
+        if (hasEntityName || hasAnyNewProperty) {
+          fallbackPaths.push(filePath);
+        }
+      }
+
+      pathsToLoad = [...new Set(fallbackPaths)];
+    }
+
+    let totalChars = 0;
+
+    for (const filePath of pathsToLoad) {
+      const extension = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
+      if (!allowedExtensions.includes(extension)) {
+        continue;
+      }
+      if (totalChars >= maxTotalChars) {
+        break;
+      }
+
+      let content: string;
+      try {
+        content = await getFileContent(filePath);
+      } catch {
+        continue;
+      }
+
+      if (!content?.trim()) {
+        continue;
+      }
+
+      const numbered = this.buildNumberedContent(content, maxCharsPerFile);
+      const slice = numbered.slice(0, maxCharsPerFile);
+      if (totalChars + slice.length > maxTotalChars) {
+        break;
+      }
+
+      result.push({ file: filePath, content: slice });
+      totalChars += slice.length;
+    }
+
+    return result;
+  };
+
+  public getEntitySchemaChangeIssues = async (issues: CodeIssueInterface[], options: LogicalDataLoadingOptions): Promise<CodeIssueInterface[]> => {
+    const enabled = process.env.ENTITY_SCHEMA_USAGE_ANALYSIS_ENABLED !== 'false';
+    if (!enabled) {
+      return [];
+    }
+
+    const candidates = issues.filter((issue) => issue.rule === 'logical-entity-schema-change' && issue.suggestion);
+    if (!candidates.length) {
+      return [];
+    }
+
+    const llm = await this.getLlm();
+    const chain = RunnableSequence.from([
+      this.entitySchemaChangePrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
+
+    const collectedIssues: CodeIssueInterface[] = [];
+
+    for (const candidate of candidates) {
+      let details: LogicalEntityChangeDetailsInterface | null = null;
+      try {
+        details = JSON.parse(candidate.suggestion as string) as LogicalEntityChangeDetailsInterface;
+      } catch {
+        details = null;
+      }
+      if (!details || details.kind !== 'entity-schema-change') {
+        continue;
+      }
+
+      const usageFiles = await this.collectEntityUsageFiles(details, options);
+      if (!usageFiles.length) {
+        continue;
+      }
+
+      const payload = {
+        entityChange: JSON.stringify(details),
+        files: JSON.stringify(usageFiles),
+      };
+
+      const raw = await chain.invoke(payload);
+
+      let items: { file: string; line: unknown; message: unknown; rule?: unknown; suggestion?: unknown; }[] = [];
+      try {
+        const jsonText = this.extractJsonPayload(typeof raw === 'string' ? raw : String(raw));
+        const parsed = JSON.parse(jsonText) as unknown;
+        if (Array.isArray(parsed)) {
+          items = parsed.filter(
+            (item): item is { file: string; line: unknown; message: unknown; rule?: unknown; suggestion?: unknown } =>
+              typeof item === 'object'
+              && item !== null
+              && 'file' in item
+              && 'line' in item
+              && 'message' in item,
+          );
+        }
+      } catch {
+        continue;
+      }
+
+      for (const item of items) {
+        const file = String(item.file);
+        const line = this.normalizeLineNumberOneBased(item.line);
+        const message = String(item.message);
+        const rule = typeof item.rule === 'string' ? item.rule : 'logical-entity-usage';
+        const suggestion = typeof item.suggestion === 'string' ? item.suggestion : undefined;
+
+        collectedIssues.push({
+          file,
+          line,
+          severity: 'error',
+          message,
+          rule,
+          suggestion,
+        });
+      }
+    }
+
+    return collectedIssues;
   };
 }

@@ -74,14 +74,17 @@ export class ScmPushAnalysisService {
 
       // Фильтрация неанализируемых файлов (.md, package-lock.json) — ScmReviewService.isExcludedFromAnalysis.
       const affectedInput = driver.getAffectedPathsInput();
+      const analysisOptions = {
+        getFileContent: affectedInput.getFileContent,
+        getSourceFilePaths: affectedInput.getSourceFilePaths,
+        ...(typeof (affectedInput as { getSourceFilePathsForEntityUsage?: () => Promise<string[]> }).getSourceFilePathsForEntityUsage === 'function'
+          && { getSourceFilePathsForEntityUsage: (affectedInput as { getSourceFilePathsForEntityUsage: () => Promise<string[]> }).getSourceFilePathsForEntityUsage }),
+      };
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
         commits,
         summaryTitle,
-        {
-          getFileContent: affectedInput.getFileContent,
-          getSourceFilePaths: affectedInput.getSourceFilePaths,
-        },
+        analysisOptions,
       );
 
       const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);

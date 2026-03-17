@@ -96,9 +96,15 @@ export class GitlabWebhookController extends BaseService {
       ref,
       { maxFiles: 200 },
     );
+    const getSourceFilePathsForEntityUsage = () => this.gitlabAgentService.getRepositorySourceFilePaths(
+      projectId,
+      ref,
+      { maxFiles: 500 },
+    );
     const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes, {
       getFileContent,
       getSourceFilePaths,
+      getSourceFilePathsForEntityUsage,
     });
 
     await this.gitlabAgentService.addComments(projectId, mergeRequestIid, recommendations);
@@ -143,6 +149,11 @@ export class GitlabWebhookController extends BaseService {
               projectId,
               ref,
               { maxFiles: 200 },
+            ),
+            getSourceFilePathsForEntityUsage: () => this.gitlabAgentService.getRepositorySourceFilePaths(
+              projectId,
+              ref,
+              { maxFiles: 500 },
             ),
             getFileContent: (filePath) => this.gitlabAgentService.getFileContentAtRef(
               projectId,

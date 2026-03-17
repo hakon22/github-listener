@@ -114,6 +114,12 @@ export class GithubWebhookController extends BaseService {
               ref,
               { maxFiles: 200 },
             ),
+            getSourceFilePathsForEntityUsage: () => this.githubAgent.getRepositorySourceFilePaths(
+              repositoryOwner,
+              event.repository.name,
+              ref,
+              { maxFiles: 500 },
+            ),
             getFileContent: (filePath) => this.githubAgent.getFileContentAtRef(
               repositoryOwner,
               event.repository.name,
@@ -205,6 +211,12 @@ export class GithubWebhookController extends BaseService {
             event.repository.name,
             ref,
             { maxFiles: 200 },
+          ),
+          getSourceFilePathsForEntityUsage: () => this.githubAgent.getRepositorySourceFilePaths(
+            repositoryOwner,
+            event.repository.name,
+            ref,
+            { maxFiles: 500 },
           ),
           getFileContent: (filePath) => this.githubAgent.getFileContentAtRef(
             repositoryOwner,
