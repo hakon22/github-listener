@@ -123,11 +123,25 @@ export class GitlabAgentService {
     options?: { pathPrefix?: string; maxFiles?: number; },
   ): Promise<string[]> => {
     await this.requestDelay();
-    const response = await this.gitlab.Repositories.allRepositoryTrees(projectId, {
-      ref,
-      recursive: true,
-      perPage: options?.maxFiles ?? 200,
-    });
+    let response: unknown[];
+    try {
+      response = await this.gitlab.Repositories.allRepositoryTrees(projectId, {
+        ref,
+        recursive: true,
+        perPage: options?.maxFiles ?? 200,
+        maxPages: 5,
+      });
+    } catch (error) {
+      const errorName = (error as { name?: string })?.name ?? '';
+      if (errorName.includes('Timeout') || errorName.includes('timeout')) {
+        const maxFiles = options?.maxFiles ?? 200;
+        const maxPages = 5;
+        const tooLargeError = new Error(`более ${maxPages * maxFiles} файлов`);
+        tooLargeError.name = 'RepositoryTooLargeError';
+        throw tooLargeError;
+      }
+      throw error;
+    }
 
     const data = Array.isArray(response) ? response : (response as { data?: { path?: string; type?: string }[] })?.data ?? response;
     const items = Array.isArray(data) ? data : [];

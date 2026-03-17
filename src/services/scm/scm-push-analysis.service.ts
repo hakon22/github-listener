@@ -74,11 +74,23 @@ export class ScmPushAnalysisService {
 
       // Фильтрация неанализируемых файлов (.md, package-lock.json) — ScmReviewService.isExcludedFromAnalysis.
       const affectedInput = driver.getAffectedPathsInput();
+      let entityUsageWarning = '';
       const analysisOptions = {
         getFileContent: affectedInput.getFileContent,
         getSourceFilePaths: affectedInput.getSourceFilePaths,
-        ...(typeof affectedInput.getSourceFilePathsForEntityUsage === 'function'
-          && { getSourceFilePathsForEntityUsage: affectedInput.getSourceFilePathsForEntityUsage }),
+        ...(typeof affectedInput.getSourceFilePathsForEntityUsage === 'function' && {
+          getSourceFilePathsForEntityUsage: async () => {
+            try {
+              return await affectedInput.getSourceFilePathsForEntityUsage!();
+            } catch (error) {
+              if ((error as Error)?.name === 'RepositoryTooLargeError') {
+                entityUsageWarning = `\n<b>Примечание:</b> анализ использования сущностей не выполнен из-за большого количества файлов: ${(error as Error).message}.`;
+                return [];
+              }
+              throw error;
+            }
+          },
+        }),
       };
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
@@ -105,7 +117,7 @@ export class ScmPushAnalysisService {
       this.loggerService.info(this.TAG, 'Push analysis completed successfully');
 
       return {
-        analysisSummary: analysisResult.analysisSummary,
+        analysisSummary: analysisResult.analysisSummary + entityUsageWarning,
         humanSummary: analysisResult.humanSummary,
         commitsSummary,
         processedFilesCount: processedFilePaths.length,
