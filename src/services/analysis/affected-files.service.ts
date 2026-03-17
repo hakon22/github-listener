@@ -13,6 +13,8 @@ export interface GetAffectedPathsOptions {
 export interface AffectedFilesInput {
   getSourceFilePaths: () => Promise<string[]>;
   getFileContent: (filePath: string) => Promise<string>;
+  /** Для анализа использования сущностей: список путей с увеличенным лимитом (по умолчанию используется getSourceFilePaths). */
+  getSourceFilePathsForEntityUsage?: () => Promise<string[]>;
 }
 
 @Singleton

@@ -77,8 +77,8 @@ export class ScmPushAnalysisService {
       const analysisOptions = {
         getFileContent: affectedInput.getFileContent,
         getSourceFilePaths: affectedInput.getSourceFilePaths,
-        ...(typeof (affectedInput as { getSourceFilePathsForEntityUsage?: () => Promise<string[]> }).getSourceFilePathsForEntityUsage === 'function'
-          && { getSourceFilePathsForEntityUsage: (affectedInput as { getSourceFilePathsForEntityUsage: () => Promise<string[]> }).getSourceFilePathsForEntityUsage }),
+        ...(typeof affectedInput.getSourceFilePathsForEntityUsage === 'function'
+          && { getSourceFilePathsForEntityUsage: affectedInput.getSourceFilePathsForEntityUsage }),
       };
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
