@@ -153,15 +153,77 @@ export class ScmReviewService {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
+  /**
+   * Типы проблем, которые разрешено включать в Telegram‑отчёт.
+   * Если переменная окружения ANALYSIS_ALLOWED_TYPES не задана,
+   * используется дефолтное поведение (severity === "error" или type === "security"),
+   * но при этом type "quality" и "best_practice" всегда исключаются.
+   */
+  private getAllowedTypesFromEnv = (): Set<AICodeIssueRecommendation['type']> | null => {
+    const raw = process.env.ANALYSIS_ALLOWED_TYPES;
+    if (!raw) {
+      return null;
+    }
+
+    const parts = raw
+      .split(',')
+      .map((part) => part.trim())
+      .filter((part): part is AICodeIssueRecommendation['type'] =>
+        part === 'quality'
+        || part === 'security'
+        || part === 'performance'
+        || part === 'best_practice',
+      );
+
+    if (!parts.length) {
+      return null;
+    }
+
+    return new Set(parts);
+  };
+
+  /**
+   * Список ESLint/логических правил, которые нужно полностью исключить из итогового отчёта.
+   * Например: ANALYSIS_EXCLUDED_RULES=logical-function-signature-change,logical-entity-schema-change
+   */
+  private getExcludedRulesFromEnv = (): Set<string> => {
+    const raw = process.env.ANALYSIS_EXCLUDED_RULES;
+    if (!raw) {
+      return new Set();
+    }
+
+    const parts = raw
+      .split(',')
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+
+    return new Set(parts);
+  };
+
   private normalizePath = (filePath: string): string => path.normalize(filePath).replace(/\\/g, '/');
 
-  /** Только критические (error/security) — приводят к ошибке в рантайме; warning и info из проекта убраны. */
   private getCriticalRecommendations = (
     recommendations: AICodeIssueRecommendation[],
-  ): AICodeIssueRecommendation[] => recommendations.filter(
-    (recommendation) =>
-      recommendation.severity === 'error' || recommendation.type === 'security',
-  );
+  ): AICodeIssueRecommendation[] => {
+    const allowedTypes = this.getAllowedTypesFromEnv();
+    const excludedRules = this.getExcludedRulesFromEnv();
+
+    const byRuleFiltered = recommendations.filter(
+      (recommendation) => !excludedRules.has(recommendation.rule),
+    );
+
+    if (allowedTypes && allowedTypes.size > 0) {
+      return byRuleFiltered.filter((recommendation) => allowedTypes.has(recommendation.type));
+    }
+
+    // Дефолтное поведение: только критические (error/security), при этом quality/best_practice всегда исключены.
+    return byRuleFiltered.filter(
+      (recommendation) =>
+        (recommendation.severity === 'error' || recommendation.type === 'security')
+        && recommendation.type !== 'quality'
+        && recommendation.type !== 'best_practice',
+    );
+  };
 
   private static readonly SNIPPET_CONTEXT_LINES = 2;
 

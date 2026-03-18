@@ -482,22 +482,43 @@ export class AIService extends ModelBaseService {
       partials = [];
     }
 
-    return issues.map((issue, index) => {
+    const recommendations: AICodeIssueRecommendation[] = [];
+
+    for (let index = 0; index < issues.length; index += 1) {
+      const issue = issues[index];
       const ai = partials[index] ?? {};
 
-      return {
-        ...issue,
-        type: ai.type ?? 'quality',
-        // message: prefer AI text but fall back to original
-        message: ai.message ?? issue.message,
-        // keep original ESLint severity, but suggestion may be refined
-        severity: issue.severity,
-        suggestion: ai.suggestion ?? issue.suggestion,
-        impact: ai.impact,
-        codeExample: ai.codeExample,
-        // preserve rule and file/line from original issue
-      };
-    });
+      // Для logical-function-signature-change нам не нужен «общий» кандидат
+      // вида «Изменилась сигнатура, проверьте все места».
+      // Если модель не вернула конкретную рекомендацию (message/impact/suggestion),
+      // просто пропускаем эту проблему, чтобы в Telegram попали только реальные риски.
+      if (
+        issue.rule === 'logical-function-signature-change'
+        && !ai.message
+        && !ai.impact
+        && !ai.suggestion
+        && !ai.codeExample
+      ) {
+        // Модель не нашла конкретных проблем по этой смене сигнатуры.
+        // Считаем это допустимым изменением и не показываем базовый кандидат.
+        // Переходим к следующей проблеме без добавления рекомендации.
+        this.loggerService.warn(`Logical function signature change without specific recommendation: ${JSON.stringify(issue)}`);
+      } else {
+        recommendations.push({
+          ...issue,
+          type: ai.type ?? 'quality',
+          // message: prefer AI text but fall back to original
+          message: ai.message ?? issue.message,
+          // keep original ESLint severity, but suggestion may be refined
+          severity: issue.severity,
+          suggestion: ai.suggestion ?? issue.suggestion,
+          impact: ai.impact,
+          codeExample: ai.codeExample,
+        });
+      }
+    }
+
+    return recommendations;
   };
 
   /**
