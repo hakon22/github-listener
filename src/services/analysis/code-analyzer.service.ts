@@ -84,6 +84,7 @@ type FunctionSignatureMetaInterface = {
   kind: 'function' | 'method';
   name: string;
   className?: string;
+  line: number;
   parameters: FunctionParameterMetaInterface[];
 };
 
@@ -282,7 +283,7 @@ export class CodeAnalyzerService {
 
       issues.push({
         file: change.file,
-        line: 1,
+        line: newSignature.line,
         severity: 'error',
         message: `Изменилась сигнатура функции или метода "${newSignature.name}". Проверьте все места, где она вызывается.`,
         rule: 'logical-function-signature-change',
@@ -421,10 +422,12 @@ export class CodeAnalyzerService {
       if (ts.isFunctionDeclaration(node) && node.name) {
         const parameters = buildParameters(node.parameters);
         const functionName = node.name.text;
+        const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
 
         signatures.set(functionName, {
           kind: 'function',
           name: functionName,
+          line,
           parameters,
         });
       }
@@ -437,11 +440,13 @@ export class CodeAnalyzerService {
             const parameters = buildParameters(member.parameters);
             const methodName = member.name.getText(sourceFile);
             const signatureName = `${className}.${methodName}`;
+            const line = sourceFile.getLineAndCharacterOfPosition(member.getStart(sourceFile)).line + 1;
 
             signatures.set(signatureName, {
               kind: 'method',
               name: signatureName,
               className,
+              line,
               parameters,
             });
           }

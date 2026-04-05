@@ -34,6 +34,7 @@ export interface AICodeIssueRecommendation extends CodeIssueInterface {
 }
 
 interface AIPartialRecommendation {
+  _idx?: number;
   type?: AICodeIssueRecommendation['type'];
   message?: string;
   suggestion?: string;
@@ -165,7 +166,7 @@ export class AIService extends ModelBaseService {
       Ты — опытный ревьюер TypeScript/Node.js кода.
       
       Тебе переданы только критические кандидаты (error/security): проблемы статического анализа и логические кандидаты на ошибки в рантайме.
-      - список проблем (file, line, message, rule, suggestion);
+      - список проблем (file, line, message, rule, suggestion, _idx);
       - похожие по смыслу фрагменты кода из проекта.
       
       Проблемы (JSON-массив):
@@ -209,9 +210,10 @@ export class AIService extends ModelBaseService {
         - это проблема, найденная логическим анализом ИИ: код обращается к полям/связям результата запроса, которые, по смыслу кода запроса, не загружаются (TypeORM relations/join, Knex select/join, raw SQL, Prisma include/select и т.д.). В рантайме — undefined или ошибка.
         - Рекомендация: добавить недостающие поля/связи в выборку. Выдели это как критичную ошибку в "impact".
       
-      Для КАЖДОЙ входной проблемы верни ОДИН элемент массива JSON СТРОГО такого вида (только если проблема реально приведёт к ошибке в рантайме или уязвимости; иначе для этой проблемы верни пустой объект {{}}, НЕ пропускай элемент — массив должен содержать ровно столько элементов, сколько входных проблем, в том же порядке):
+      Каждая входная проблема содержит поле "_idx" — уникальный порядковый номер. Верни JSON-массив ТОЛЬКО для критических проблем (ошибка в рантайме, падение, security). Для некритических проблем элемент в массив не включай. Каждый элемент ОБЯЗАТЕЛЬНО должен содержать "_idx" — тот же номер, что в исходной проблеме:
       [
         {{
+          "_idx": <число из поля _idx входной проблемы>,
           "type": "security" или "performance" (только если приведёт к падению/ошибке; не используй quality/best_practice),
           "message": "Краткое описание проблемы (1 предложение, по-русски, не более 160 символов)",
           "suggestion": "Краткая рекомендация, как исправить (1 предложение, по-русски, не более 160 символов)",
@@ -462,8 +464,10 @@ export class AIService extends ModelBaseService {
       projectPatterns.push([]);
     }
 
+    const issuesWithIdx = issues.map((issue, index) => ({ ...issue, _idx: index }));
+
     const result = await chain.invoke({
-      issues: JSON.stringify(issues),
+      issues: JSON.stringify(issuesWithIdx),
       projectPatterns: JSON.stringify(projectPatterns),
     });
 
@@ -487,11 +491,18 @@ export class AIService extends ModelBaseService {
       partials = [];
     }
 
+    const partialsByIdx = new Map<number, AIPartialRecommendation>();
+    for (const partial of partials) {
+      if (typeof partial._idx === 'number') {
+        partialsByIdx.set(partial._idx, partial);
+      }
+    }
+
     const recommendations: AICodeIssueRecommendation[] = [];
 
     for (let index = 0; index < issues.length; index += 1) {
       const issue = issues[index];
-      const ai = partials[index] ?? {};
+      const ai = partialsByIdx.get(index) ?? {};
 
       // Для logical-function-signature-change нам не нужен «общий» кандидат
       // вида «Изменилась сигнатура, проверьте все места».

@@ -42,7 +42,7 @@ const eslint = [
       '@typescript-eslint/no-shadow': 'off',
       '@typescript-eslint/no-explicit-any': 'off',
       'no-underscore-dangle': ['error', {
-        allow: ['__filename', '__dirname'],
+        allow: ['__filename', '__dirname', '_idx'],
       }],
       'linebreak-style': 'off',
       'no-param-reassign': 'off',
