@@ -1,7 +1,6 @@
 import { Octokit } from '@octokit/rest';
 import { Container, Singleton } from 'typescript-ioc';
 
-import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import { ScmChangeBuilderService } from '@/services/scm/scm-change-builder.service';
 import {
   API_REQUEST_TIMEOUT_MS,
@@ -9,6 +8,7 @@ import {
   createRateLimiter,
   DELAY_BETWEEN_REQUESTS_MS,
 } from '@/utils/api-request.utils';
+import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 @Singleton
 export class GithubAgent {

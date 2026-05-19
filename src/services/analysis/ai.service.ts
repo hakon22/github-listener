@@ -1,14 +1,15 @@
 import * as path from 'path';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
 import { ModelBaseService } from '@/services/core/model-base.service';
+import { buildIssueFilterContext, filterCodeIssues } from '@/services/analysis/issue-filter.service';
+import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
+import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 import { Container, Singleton } from 'typescript-ioc';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { StringOutputParser } from '@langchain/core/output_parsers';
 import { RunnableSequence } from '@langchain/core/runnables';
 import ts from 'typescript';
-import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
-import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 export type GetFileContentFn = (filePath: string) => Promise<string>;
 
@@ -18,6 +19,8 @@ export interface LogicalDataLoadingOptions {
   getSourceFilePaths?: () => Promise<string[]>;
   /** Для анализа использования сущностей: список путей с увеличенным лимитом (по умолчанию используется getSourceFilePaths, часто ограниченный 200 файлами). */
   getSourceFilePathsForEntityUsage?: () => Promise<string[]>;
+  /** Пути, реально изменённые в push/MR (для отсечения impact-only файлов). */
+  changedPaths?: Set<string>;
 }
 
 interface TsconfigPathsInterface {
@@ -316,7 +319,8 @@ export class AIService extends ModelBaseService {
       Не описывай весь файл целиком — только то, что реально изменилось. Опирайся на "diff"; "newContent" — для контекста при необходимости.
       
       Ответ: максимум 3-4 коротких предложения, по-русски, без Markdown и списков.
-      Если в "Проблемы" передан непустой массив — обязательно упомяни хотя бы одну-две проблемы (файл, суть). Фразу «критичных проблем не обнаружено» пиши только если массив проблем действительно пуст.
+      Если в "Проблемы" передан непустой массив — обязательно упомяни хотя бы одну-две проблемы (файл, суть). Фразу «критичных проблем не обнаружено» пиши только если массив проблем действительно пуст — при непустом массиве эту фразу ЗАПРЕЩЕНО использовать.
+      Не пиши «вызовы сломаны» / «Incorrect parameter count» для параметров с значением по умолчанию (param = value) или optional (param?: Type) — они обратно совместимы.
       
       ТРЕБОВАНИЯ: Пиши ТОЛЬКО по-русски, простой текст. Опирайся на "diff".
     `);
@@ -348,17 +352,33 @@ export class AIService extends ModelBaseService {
       ВАЖНО: поле "newContent" уже содержит пронумерованные строки исходного файла в формате "N: код_строки", где N — номер строки, начиная с 1. Когда возвращаешь поле "line" в ответе — используй ИМЕННО этот номер N из префикса "N:". Не придумывай номера строк сам, всегда опирайся на префикс.
       
       Задача: найди только те проблемы, которые гарантированно приведут к ошибке в рантайме, падению или уязвимости. Не сообщай warning/info, стилистику, догадки.
+
+      DIFF И АКТУАЛЬНЫЙ КОД:
+      - Анализируй в первую очередь строки diff с префиксом + (добавлено) и итоговый newContent.
+      - Строки только с префиксом - (удалено) — это старый код, НЕ сообщай по ним проблемы как о текущем состоянии.
+      - Если на строке уже есть защита (?., ??, || fallback, JSON.stringify, import) — не сообщай.
+      - Object.values(Enum) в TypeScript безопасен. Параметры с = default и param?: не ломают старые вызовы.
+      - @QueryRestActionInjectDecorator / @BodyRestActionInjectDecorator / @ParamsRestActionInjectDecorator — DTO-валидация уже есть; не пиши «нет валидации» на middlewares:/name: metadata.
+      - hasOwnProperty на типизированном config — не critical. eslint/style (let/const, ;) — не security.
+
+      ОБЯЗАТЕЛЬНОЕ ПРАВИЛО УВЕРЕННОСТИ (ORM, «незагруженные» поля, undefined):
+      - Про отсутствие relations/include/select и про обращение к неподгруженным связям сообщай ТОЛЬКО если на 100% проследил цепочку от запроса к данным до этой строки и доказал несоответствие. Любое сомнение, другой источник объекта (массив, .map, литерал, параметр извне без показанного find) — не включай проблему.
+      - НЕ сообщай как критический runtime-crash случаи, где обращение к relation происходит внутри блока с guard через optional chaining, например if (entity.relation?.length) {{ entity.relation.map(...) }}. Это уже защищённый доступ.
+      - Не путай переменные: в «message» должны фигурировать те же идентификаторы, что участвуют в выражении на строке «line». Если в тексте назван объект/переменная X, а на строке «line» в проблемном выражении X нет — проблему не добавляй.
+      - Запрещено писать про «undefined объекта X» или «обращение к свойству … объекта X», если на строке «line» нет идентификатора X в том же фрагменте кода, о котором идёт речь.
+
       Проверь:
       - Безопасность: eval, небезопасные вызовы (execSync), XSS-риски (.innerHTML и т.п.).
-      - Загрузка данных: обращение к полям/связям объектов, которые не загружаются в запросе (relations, include, select) — только если это приведёт к ошибке в рантайме. (1) Свойство в типе обязательное (без ?) — не сообщай. (2) Вложенные свойства (relation.field), не загруженные в БД — сообщай. (3) Типы из node_modules не проверяй.
+      - Загрузка данных: обращение к полям/связям объектов, которые не загружаются в запросе (relations, include, select) — только если это приведёт к ошибке в рантайме. Не считай ошибкой рантайма guarded-доступ через ?./?? или if (obj.relation?....) перед использованием. (1) Свойство в типе обязательное (без ?) — не сообщай. (2) Вложенные свойства (relation.field), не загруженные в БД — сообщай при незащищённом доступе. (3) Типы из node_modules не проверяй.
       - Контракты: изменение схем сущностей или сигнатур без обновления вызывающего кода — только если вызов сломается в рантайме.
-      
-      Цепочка вызовов для "line": если проблема — отсутствующая relation в findOne/find, то "line" должна указывать на строку, где используется именно РЕЗУЛЬТАТ ЭТОГО запроса (по цепочке вызовов). Например: findOne в методе A → A вызывает B(transaction) → в B обращаются к transaction.order.positions[].item.translations. Указывай строку в B (где реально произойдёт ошибка), а не похожий код в другом методе C, который получает order из параметра/другого источника. Одна и та же сущность может использоваться в разных методах — важен тот метод, куда передаётся результат данного find.
-      
+
+      Цепочка вызовов для "line": если проблема — отсутствующая relation в findOne/find, то "line" должна указывать на строку, где используется именно РЕЗУЛЬТАТ ЭТОГО запроса (по цепочке вызовов). Указывай строку где реально произойдёт ошибка.
+
       СТРОГО СВЯЗЫВАЙ "line" И ТЕКСТ ПРОБЛЕМЫ:
-      - Строка "line" должна содержать (или быть в радиусе 1–3 строк от) реальное проблемное выражение, о котором ты пишешь в "message" и "suggestion".
+      - Строка "line" должна БУКВАЛЬНО содержать то выражение, о котором ты пишешь в "message". Для проблем с незагруженными полями — это строка с самим обращением к свойству (например, "task.tenant.subdomain"), а не строка рядом.
       - Нельзя описывать проблему в SQL/ORM/бизнес-логике, если в указанной строке нет кода, напрямую относящегося к этой проблеме. Например, нельзя писать про tenant.timezone или leftJoin, если "line" указывает на объявление интерфейса, комментарий или тип без этого кода.
       - Если ты не можешь однозначно сопоставить описание проблемы с конкретной строкой кода — просто НЕ ДОБАВЛЯЙ такую проблему в ответ.
+      - САМОПРОВЕРКА перед выдачей каждой проблемы: найди в "newContent" строку с номером "line" и убедись, что она содержит выражение из "message". Если нет — исправь "line" или удали проблему.
       
       Верни JSON-массив проблем СТРОГО в формате (только severity "error" — warning и info не используем):
       [
@@ -542,7 +562,10 @@ export class AIService extends ModelBaseService {
    * Возвращает список проблем (безопасность, производительность, загрузка данных, контракты).
    * Включать через USE_UNIFIED_AI_ANALYSIS=true как альтернативу getLogicalDataLoadingIssues.
    */
-  public getUnifiedAnalysisIssues = async (changes: ScmChangeInterface[]): Promise<CodeIssueInterface[]> => {
+  public getUnifiedAnalysisIssues = async (
+    changes: ScmChangeInterface[],
+    changedPaths?: Set<string>,
+  ): Promise<CodeIssueInterface[]> => {
     if (!changes.length) {
       return [];
     }
@@ -576,6 +599,13 @@ export class AIService extends ModelBaseService {
 
     if (!payload.length) {
       return [];
+    }
+
+    const contentByFileForUnified = new Map<string, string>();
+    for (const change of changes) {
+      if (change.newContent?.trim()) {
+        contentByFileForUnified.set(path.normalize(change.file).replace(/\\/g, '/'), change.newContent);
+      }
     }
 
     const llm = await this.getLlm();
@@ -620,12 +650,16 @@ export class AIService extends ModelBaseService {
           suggestion: typeof item.suggestion === 'string' ? item.suggestion : undefined,
         }));
 
-      this.loggerService.debug(
-        this.TAG,
-        'AI unifiedAnalysisIssues mapped',
-        mapped.slice(0, 20),
+      const filteredMapped = mapped.filter((issue) =>
+        !this.isGuardedDataLoadingIssue(issue, contentByFileForUnified),
       );
-      return mapped.filter((issue) => issue.severity === 'error');
+
+      const afterLegacyFilters = filteredMapped
+        .filter((issue) => issue.severity === 'error')
+        .filter((issue) => this.isUnifiedIssueBlameLineCoherentWithMessage(issue, contentByFileForUnified));
+
+      const filterContext = buildIssueFilterContext(changes, changedPaths);
+      return filterCodeIssues(afterLegacyFilters, filterContext);
     } catch {
       return [];
     }
@@ -1128,7 +1162,164 @@ export class AIService extends ModelBaseService {
       return false;
     }
     const line = lines[lineIndex];
-    return /\?\./.test(line) || /\?\?/.test(line);
+    return /\?\./.test(line) || /\?\?/.test(line) || /\|\|\s*\{/.test(line);
+  };
+
+  /** Для unified-анализа отфильтровывает data-loading issue с безопасным guard-условием выше по коду. */
+  private isGuardedDataLoadingIssue = (
+    issue: { file: string; line: number; message: string; rule?: string; },
+    contentByFile: Map<string, string>,
+  ): boolean => {
+    if (!this.isLikelyDataLoadingIssue(issue)) {
+      return false;
+    }
+    return this.isDataLoadingAccessGuardedByOptionalIfAbove(issue.file, issue.line, contentByFile);
+  };
+
+  private isLikelyDataLoadingIssue = (issue: { message: string; rule?: string; }): boolean => {
+    const normalizedRule = (issue.rule ?? '').toLowerCase();
+    if (normalizedRule.includes('data-loading') || normalizedRule.includes('query-result-mismatch')) {
+      return true;
+    }
+    return /(relations?|include|select|join|не\s*загруж|не\s*подгруж|undefined)/i.test(issue.message);
+  };
+
+  /**
+   * Проверяет паттерн: строка с .map/.forEach/... над relation внутри блока if,
+   * где выше есть guard `obj.relation?.*`.
+   */
+  private isDataLoadingAccessGuardedByOptionalIfAbove = (
+    filePath: string,
+    lineOneBased: number,
+    contentByFile: Map<string, string>,
+    lookbackLines = 60,
+  ): boolean => {
+    const content = contentByFile.get(path.normalize(filePath).replace(/\\/g, '/'));
+    if (!content) {
+      return false;
+    }
+    const lines = content.split('\n');
+    const lineIndex = lineOneBased - 1;
+    if (lineIndex < 0 || lineIndex >= lines.length) {
+      return false;
+    }
+    const line = lines[lineIndex] ?? '';
+    const pathBeforeCollectionAccess = this.extractPathBeforeCollectionAccess(line);
+    if (!pathBeforeCollectionAccess) {
+      return false;
+    }
+
+    const start = Math.max(0, lineIndex - lookbackLines);
+    for (let index = lineIndex - 1; index >= start; index -= 1) {
+      const candidate = (lines[index] ?? '').trim();
+      if (!candidate.startsWith('if')) {
+        continue;
+      }
+      const openParenIndex = candidate.indexOf('(');
+      const closeParenIndex = candidate.lastIndexOf(')');
+      if (openParenIndex === -1 || closeParenIndex <= openParenIndex) {
+        continue;
+      }
+      const condition = candidate.slice(openParenIndex + 1, closeParenIndex);
+      if (this.conditionHasOptionalGuardForPath(condition, pathBeforeCollectionAccess)) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  private extractPathBeforeCollectionAccess = (line: string): string | null => {
+    const methodMatch = line.match(
+      /\b([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)+)\s*\.\s*(?:map|forEach|filter|reduce|flatMap|find|some|every)\s*\(/,
+    );
+    if (methodMatch?.[1]) {
+      return methodMatch[1].replace(/\s+/g, '');
+    }
+
+    const indexMatch = line.match(/\b([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)+)\s*\[/);
+    if (indexMatch?.[1]) {
+      return indexMatch[1].replace(/\s+/g, '');
+    }
+
+    return null;
+  };
+
+  private conditionHasOptionalGuardForPath = (condition: string, propertyPath: string): boolean => {
+    const segments = propertyPath.split('.').filter(Boolean);
+    if (segments.length < 2) {
+      return false;
+    }
+    const escapedSegments = segments.map((segment) => this.escapeRegexForIdentifier(segment));
+    const pathWithOptionalBetweenSegments = escapedSegments.slice(1).reduce(
+      (acc, segment) => `${acc}\\s*\\?*\\s*\\.\\s*${segment}`,
+      `\\b${escapedSegments[0]}`,
+    );
+    const pattern = new RegExp(`${pathWithOptionalBetweenSegments}\\s*\\?\\s*\\.`, 'i');
+    return pattern.test(condition);
+  };
+
+  private escapeRegexForIdentifier = (identifier: string): string =>
+    identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  /**
+   * Идентификаторы, которые модель явно называет «undefined-объектом» / «объектом X» в тексте.
+   */
+  private extractExplicitBlamedIdentifiersFromMessage = (message: string): string[] => {
+    const seen = new Set<string>();
+    const reserved = new Set([
+      'undefined',
+      'null',
+      'true',
+      'false',
+      'object',
+      'TypeError',
+      'Error',
+      'Promise',
+    ]);
+    const patterns = [
+      /на\s+undefined\s+объект[еа]\s+(\w+)/gi,
+      /undefined\s+объект[еа]\s+(\w+)/gi,
+      /на\s+объект[еа]\s+(\w+)/gi,
+      /объект[еа]\s+(\w+)\s+привед/gi,
+      /on\s+undefined\s+(?:object|instance)\s+(\w+)/gi,
+      /undefined\s+(?:object|instance)\s+(\w+)/gi,
+    ];
+    for (const pattern of patterns) {
+      let match: RegExpExecArray | null;
+      const clone = new RegExp(pattern.source, pattern.flags);
+      while ((match = clone.exec(message)) !== null) {
+        const id = match[1];
+        if (id && !reserved.has(id) && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(id)) {
+          seen.add(id);
+        }
+      }
+    }
+    return [...seen];
+  };
+
+  /**
+   * Единый AI-анализ: если в message явно назван объект X, на строке line должен быть X.
+   */
+  private isUnifiedIssueBlameLineCoherentWithMessage = (
+    issue: { file: string; line: number; message: string; },
+    contentByFile: Map<string, string>,
+  ): boolean => {
+    const content = contentByFile.get(path.normalize(issue.file).replace(/\\/g, '/'));
+    if (!content) {
+      return true;
+    }
+    const lines = content.split('\n');
+    const lineIndex = issue.line - 1;
+    if (lineIndex < 0 || lineIndex >= lines.length) {
+      return false;
+    }
+    const lineText = lines[lineIndex];
+    const blamed = this.extractExplicitBlamedIdentifiersFromMessage(issue.message);
+    if (!blamed.length) {
+      return true;
+    }
+    return blamed.every((name) => new RegExp(`\\b${this.escapeRegexForIdentifier(name)}\\b`).test(lineText));
   };
 
   /**

@@ -2,10 +2,16 @@ import * as path from 'path';
 import { Container, Singleton } from 'typescript-ioc';
 
 import { AIService } from '@/services/analysis/ai.service';
-import type { AICodeIssueRecommendation, GetFileContentFn, LogicalDataLoadingOptions } from '@/services/analysis/ai.service';
 import { CodeAnalyzerService } from '@/services/analysis/code-analyzer.service';
-import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
+import { deduplicateIssues } from '@/services/analysis/false-positive-filters';
+import {
+  buildIssueFilterContext,
+  filterCodeIssues,
+  sanitizeHumanSummary,
+} from '@/services/analysis/issue-filter.service';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
+import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
+import type { AICodeIssueRecommendation, GetFileContentFn, LogicalDataLoadingOptions } from '@/services/analysis/ai.service';
 
 export interface ScmCommitSummaryInterface {
   id: string;
@@ -42,18 +48,23 @@ export class ScmReviewService {
     changes: ScmChangeInterface[],
     commits: ScmCommitSummaryInterface[],
     summaryTitle: string,
-    options?: { getFileContent?: GetFileContentFn; getSourceFilePaths?: () => Promise<string[]>; },
+    options?: {
+      getFileContent?: GetFileContentFn;
+      getSourceFilePaths?: () => Promise<string[]>;
+      changedPaths?: Set<string>;
+    },
   ): Promise<{ analysisSummary: string; humanSummary: string; }> => {
     const analyzableChanges = changes.filter((change) => !ScmReviewService.isExcludedFromAnalysis(change.file));
     const recommendations = await this.getRecommendationsForChanges(analyzableChanges, options);
     const criticalRecommendations = this.getCriticalRecommendations(recommendations);
     const topIssues = criticalRecommendations.slice(0, ScmReviewService.TOP_ISSUES_LIMIT);
 
-    const humanSummary = await this.aiService.summarizePush(
+    const rawHumanSummary = await this.aiService.summarizePush(
       commits,
       topIssues,
       analyzableChanges,
     );
+    const humanSummary = sanitizeHumanSummary(rawHumanSummary, criticalRecommendations.length);
 
     const analysisSummary = await this.buildAnalysisSummary(
       summaryTitle,
@@ -77,8 +88,16 @@ export class ScmReviewService {
     await this.vectorStoreService.indexMergeRequestChanges(analyzableChanges);
 
     const analysis = await this.analyzerService.analyzeChanges(analyzableChanges);
+    const changedPaths = (
+      typeof options === 'object'
+      && options !== null
+      && 'changedPaths' in options
+    )
+      ? (options as { changedPaths?: Set<string>; }).changedPaths
+      : undefined;
+
     const logicalDataIssues = process.env.USE_UNIFIED_AI_ANALYSIS === 'true'
-      ? await this.aiService.getUnifiedAnalysisIssues(analyzableChanges)
+      ? await this.aiService.getUnifiedAnalysisIssues(analyzableChanges, changedPaths)
       : await this.aiService.getLogicalDataLoadingIssues(analyzableChanges, options);
     const logicalOptions: LogicalDataLoadingOptions =
       typeof options === 'function'
@@ -99,8 +118,13 @@ export class ScmReviewService {
     const allIssues = [...analysisWithoutEntitySchemaPrompt, ...logicalDataIssues, ...entitySchemaIssues].filter(
       (issue) => issue.severity === 'error',
     );
-    const recommendations = await this.aiService.getRecommendations(allIssues);
-    return this.getCriticalRecommendations(recommendations);
+
+    const filterContext = buildIssueFilterContext(analyzableChanges, changedPaths);
+    const filteredIssues = filterCodeIssues(allIssues, filterContext);
+
+    const recommendations = await this.aiService.getRecommendations(filteredIssues);
+    const filteredRecommendations = this.filterRecommendations(recommendations, filterContext);
+    return this.getCriticalRecommendations(filteredRecommendations);
   };
 
   public buildAnalysisErrorSummary = (error: unknown): string => {
@@ -216,13 +240,35 @@ export class ScmReviewService {
       return byRuleFiltered.filter((recommendation) => allowedTypes.has(recommendation.type));
     }
 
-    // Дефолтное поведение: только критические (error/security), при этом quality/best_practice всегда исключены.
+    // Только severity error; quality/best_practice и чистый AI-performance без доказанного crash — исключены.
     return byRuleFiltered.filter(
       (recommendation) =>
-        (recommendation.severity === 'error' || recommendation.type === 'security')
+        recommendation.severity === 'error'
         && recommendation.type !== 'quality'
-        && recommendation.type !== 'best_practice',
+        && recommendation.type !== 'best_practice'
+        && recommendation.type !== 'performance',
     );
+  };
+
+  private filterRecommendations = (
+    recommendations: AICodeIssueRecommendation[],
+    filterContext: ReturnType<typeof buildIssueFilterContext>,
+  ): AICodeIssueRecommendation[] => {
+    const asIssues = recommendations.map((recommendation) => ({
+      file: recommendation.file,
+      line: recommendation.line,
+      severity: recommendation.severity,
+      message: recommendation.message,
+      rule: recommendation.rule,
+      suggestion: recommendation.suggestion,
+    }));
+    const kept = new Set(
+      filterCodeIssues(asIssues, filterContext).map((issue) => `${issue.file}:${issue.line}:${issue.message}`),
+    );
+    const filtered = recommendations.filter((recommendation) =>
+      kept.has(`${recommendation.file}:${recommendation.line}:${recommendation.message}`),
+    );
+    return deduplicateIssues(filtered);
   };
 
   private static readonly SNIPPET_CONTEXT_LINES = 2;

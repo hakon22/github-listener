@@ -1,10 +1,10 @@
 import { Gitlab } from '@gitbeaker/rest';
 import { Container, Singleton } from 'typescript-ioc';
 
-import type { AICodeIssueRecommendation } from '@/services/analysis/ai.service';
-import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import { ScmChangeBuilderService } from '@/services/scm/scm-change-builder.service';
 import { createRateLimiter, DELAY_BETWEEN_REQUESTS_MS } from '@/utils/api-request.utils';
+import type { AICodeIssueRecommendation } from '@/services/analysis/ai.service';
+import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
 interface MergeRequestDiffItem {
   old_path?: string;

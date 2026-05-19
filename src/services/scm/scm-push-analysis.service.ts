@@ -92,11 +92,14 @@ export class ScmPushAnalysisService {
           },
         }),
       };
+      const normalizePath = (filePath: string): string => filePath.replace(/\\/g, '/');
+      const changedFilePathSet = new Set(changedPaths.map(normalizePath));
+
       const analysisResult = await this.scmReviewService.analyzeAndSummarizeChanges(
         mergedChanges,
         commits,
         summaryTitle,
-        analysisOptions,
+        { ...analysisOptions, changedPaths: changedFilePathSet },
       );
 
       const commitsSummary = this.scmReviewService.buildCommitsSummary(commits);
@@ -106,10 +109,6 @@ export class ScmPushAnalysisService {
 
       // Для детализации показываем только файлы, которые не были изменены в коммите,
       // а были дополнительно загружены моделью по связям (impact analysis).
-      const normalizePath = (filePath: string): string => filePath.replace(/\\/g, '/');
-      const changedFilePathSet = new Set(
-        changedPaths.map((filePath) => normalizePath(filePath)),
-      );
       const processedFilePaths = analyzableChanges
         .map((change) => normalizePath(change.file))
         .filter((filePath) => !changedFilePathSet.has(filePath));

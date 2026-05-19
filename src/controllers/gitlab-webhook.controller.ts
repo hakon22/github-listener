@@ -101,10 +101,12 @@ export class GitlabWebhookController extends BaseService {
       ref,
       { maxFiles: 500 },
     );
+    const changedPaths = new Set(changes.map((change) => change.file));
     const recommendations = await this.scmReviewService.getRecommendationsForChanges(changes, {
       getFileContent,
       getSourceFilePaths,
       getSourceFilePathsForEntityUsage,
+      changedPaths,
     });
 
     await this.gitlabAgentService.addComments(projectId, mergeRequestIid, recommendations);
