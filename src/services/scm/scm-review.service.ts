@@ -122,7 +122,7 @@ export class ScmReviewService {
     const filterContext = buildIssueFilterContext(analyzableChanges, changedPaths);
     const filteredIssues = filterCodeIssues(allIssues, filterContext);
 
-    const recommendations = await this.aiService.getRecommendations(filteredIssues);
+    const recommendations = await this.aiService.getRecommendations(filteredIssues, { filterContext });
     const filteredRecommendations = this.filterRecommendations(recommendations, filterContext);
     return this.getCriticalRecommendations(filteredRecommendations);
   };
@@ -246,7 +246,11 @@ export class ScmReviewService {
         recommendation.severity === 'error'
         && recommendation.type !== 'quality'
         && recommendation.type !== 'best_practice'
-        && recommendation.type !== 'performance',
+        && recommendation.type !== 'performance'
+        && (
+          recommendation.rule !== 'unified-ai'
+          || Boolean(recommendation.evidenceQuote?.trim())
+        ),
     );
   };
 

@@ -1,8 +1,10 @@
 import {
+  isIntentionalUrlSlashChangeInDiff,
   isLineOutsideDiffHunks,
   isMessageAboutRemovedDiffOnly,
   isRecommendationAlreadyApplied,
 } from '@/services/analysis/diff-aware.utils';
+import { failsEvidenceGate } from '@/services/analysis/evidence-gate';
 import {
   isLineAfterEarlyReturnGuard,
   isLineCoherentWithMessage,
@@ -94,6 +96,99 @@ const hasGuardOnLine = (lineText: string): boolean =>
 const isParseFloatWithFallbackFalsePositive = (lineText: string, message: string): boolean =>
   /parseFloat\s*\([^)]+\)\s*\|\|\s*0/.test(lineText)
   && messageMatches(message, [/NaN/i, /parseFloat/i, /undefined/i]);
+
+/** parseInt(x, 10) || 0 — NaN guarded */
+const isParseIntWithFallbackFalsePositive = (lineText: string, message: string): boolean =>
+  /parseInt\s*\([^)]+\)\s*,\s*10\s*\)\s*\|\|\s*0/.test(lineText)
+  && messageMatches(message, [/NaN/i, /parseInt/i, /undefined/i, /числ/i]);
+
+/** delete obj.prop — removal, not read */
+const isDeleteOperatorFalsePositive = (lineText: string, message: string): boolean =>
+  /\bdelete\s+/.test(lineText)
+  && messageMatches(message, [/удалён/i, /удален/i, /delete/i, /доступ/i, /обращен/i, /свойств/i, /undefined/i]);
+
+/** Optional field in type signature */
+const isTypeAnnotationOptionalFalsePositive = (lineText: string, message: string): boolean =>
+  (/\?\s*:\s*\w+/.test(lineText) || /:\s*Observable<\{[^}]*\?\s*:/.test(lineText))
+  && messageMatches(message, [/undefined/i, /message\?/i, /опциональн/i, /неопредел/i, /поле/i, /reason\?/i]);
+
+/** New enum member — not a runtime crash by itself */
+const isEnumMemberAdditionFalsePositive = (lineText: string, message: string, file: string): boolean =>
+  /\.enum\.ts$/i.test(file.replace(/\\/g, '/'))
+  && /=\s*['"][\w-]+['"]\s*,?\s*$/.test(lineText.trim())
+  && messageMatches(message, [/не\s+обрабатывается/i, /enum/i, /уведомлен/i, /канал/i, /switch/i]);
+
+/** Blamed object is numeric literal in message */
+const isObjectLiteralNumericKeyFalsePositive = (lineText: string, message: string): boolean => {
+  const objectBlame = message.match(/объект[ае]?\s+['"`]?(\d+)['"`]?/i);
+  if (!objectBlame?.[1]) {
+    return false;
+  }
+  return /\{\s*id\s*:\s*\d+/.test(lineText);
+};
+
+/** Assignment to variable while message claims nested property access */
+const isSimpleAssignmentNotNestedAccess = (lineText: string, message: string): boolean => {
+  if (!messageMatches(message, [/dataSets/i, /items/i, /\.items/i, /plot\./i, /page\./i])) {
+    return false;
+  }
+  const assignMatch = lineText.match(/=\s*(\w+)\s*;?\s*$/);
+  if (!assignMatch?.[1]) {
+    return false;
+  }
+  return !lineText.includes('.');
+};
+
+/** SQL / knex.raw string literals */
+const isSqlOrKnexRawStringFalsePositive = (lineText: string, message: string): boolean =>
+  (/\.raw\s*\(/.test(lineText) || /COALESCE|SELECT|INSERT|UPDATE/i.test(lineText))
+  && messageMatches(message, [/SQL/i, /поле/i, /колонк/i, /запят/i, /tenant_id/i, /несуществующ/i, /syntax/i]);
+
+/** TypeORM relation decorator — optional collection */
+const isTypeOrmRelationDecoratorFalsePositive = (lineText: string, message: string): boolean =>
+  /@(?:OneToMany|ManyToOne|OneToOne)\s*\(/.test(lineText)
+  && messageMatches(message, [/инициализир/i, /history/i, /OneToMany/i, /коллекц/i, /конструктор/i]);
+
+/** Angular template guards */
+const isAngularTemplateGuardedFalsePositive = (lineText: string, message: string, file: string): boolean => {
+  if (!/\.html$/i.test(file.replace(/\\/g, '/'))) {
+    return false;
+  }
+  if (/\*ngIf="[^"]*\s+as\s+\w+/.test(lineText)) {
+    return messageMatches(message, [/item/i, /undefined/i, /отсутств/i]);
+  }
+  if (/\|\s*\w+/.test(lineText) && messageMatches(message, [/undefined/i, /Erp1cVerify/i, /pipe/i])) {
+    return true;
+  }
+  if (/\[attr\.title\]/.test(lineText) && messageMatches(message, [/XSS/i, /title/i, /undefined/i])) {
+    return true;
+  }
+  if (/chartMode/.test(lineText) && messageMatches(message, [/chartMode/i, /не\s+определ/i])) {
+    return true;
+  }
+  return false;
+};
+
+/** await already present */
+const isAwaitAlreadyPresentFalsePositive = (lineText: string, message: string): boolean =>
+  /\bawait\b/.test(lineText)
+  && messageMatches(message, [/await/i, /асинхрон/i, /промис/i, /Promise/i]);
+
+/** Signature-only line — compile-time */
+const isCompileTimeSignatureFalsePositive = (lineText: string, message: string): boolean => {
+  const isDecl = /^\s*(?:export\s+)?(?:async\s+)?function\s+\w+/.test(lineText)
+    || /^\s*(?:public|private|protected)\s+\w+\s*\([^)]*\)/.test(lineText);
+  if (!isDecl) {
+    return false;
+  }
+  return messageMatches(message, [/сигнатур/i, /параметр/i, /вызов/i, /createConcrete/i, /changeGroupSums/i]);
+};
+
+/** Race / concurrency without code path on line */
+const isSpeculativeConcurrencyFalsePositive = (lineText: string, message: string): boolean =>
+  messageMatches(message, [/race\s*condition/i, /гонк/i, /синхрониз/i, /атомарн/i, /параллельн/i])
+  && !/\bawait\b/.test(lineText)
+  && !/transaction|lock|mutex|advisory/i.test(lineText);
 
 /** Knex builder.toQuery() — not a missing table check issue */
 const isKnexToQueryFalsePositive = (lineText: string, message: string): boolean =>
@@ -249,6 +344,62 @@ export const isFalsePositiveIssue = (input: IssueFilterInput): boolean => {
   }
 
   if (isParseFloatWithFallbackFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isParseIntWithFallbackFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isDeleteOperatorFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isTypeAnnotationOptionalFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isEnumMemberAdditionFalsePositive(lineText, message, input.file)) {
+    return true;
+  }
+
+  if (isObjectLiteralNumericKeyFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isSimpleAssignmentNotNestedAccess(lineText, message)) {
+    return true;
+  }
+
+  if (isSqlOrKnexRawStringFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isTypeOrmRelationDecoratorFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isAngularTemplateGuardedFalsePositive(lineText, message, input.file)) {
+    return true;
+  }
+
+  if (isAwaitAlreadyPresentFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (diff && isIntentionalUrlSlashChangeInDiff(lineText, message, suggestion, diff)) {
+    return true;
+  }
+
+  if (isCompileTimeSignatureFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (isSpeculativeConcurrencyFalsePositive(lineText, message)) {
+    return true;
+  }
+
+  if (failsEvidenceGate(input)) {
     return true;
   }
 

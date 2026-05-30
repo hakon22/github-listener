@@ -8,6 +8,8 @@ import {
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
 
+export const SNIPPET_CONTEXT_LINES = 5;
+
 export interface IssueFilterContext {
   contentByFile: Map<string, string>;
   diffByFile: Map<string, string>;
@@ -52,10 +54,23 @@ const getLineText = (content: string, lineOneBased: number): string => {
   return lines[index] ?? '';
 };
 
-export const filterCodeIssues = (
-  issues: CodeIssueInterface[],
-  context: IssueFilterContext,
-): CodeIssueInterface[] => {
+/** Code context around issue line for skeptic review. */
+export const buildCodeSnippetForIssue = (content: string, lineOneBased: number): string => {
+  const lines = content.split('\n');
+  const lineIndex = lineOneBased - 1;
+  const start = Math.max(0, lineIndex - SNIPPET_CONTEXT_LINES);
+  const end = Math.min(lines.length, lineIndex + SNIPPET_CONTEXT_LINES + 1);
+  return lines
+    .slice(start, end)
+    .map((snippetLine, index) => {
+      const currentLineNum = start + index + 1;
+      const marker = currentLineNum === lineOneBased ? ' →' : '  ';
+      return `${currentLineNum}${marker} ${snippetLine}`;
+    })
+    .join('\n');
+};
+
+export const filterCodeIssues = (issues: CodeIssueInterface[], context: IssueFilterContext): CodeIssueInterface[] => {
   const filtered = issues.filter((issue) => {
     const normalizedFile = path.normalize(issue.file).replace(/\\/g, '/');
     const fileContent = context.contentByFile.get(normalizedFile) ?? '';

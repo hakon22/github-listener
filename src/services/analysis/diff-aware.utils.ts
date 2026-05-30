@@ -129,5 +129,65 @@ export const isRecommendationAlreadyApplied = (lineText: string, message: string
     return true;
   }
 
+  if (
+    (combined.includes('await') || combined.includes('асинхрон'))
+    && /\bawait\b/.test(lineText)
+  ) {
+    return true;
+  }
+
+  if (
+    (combined.includes('try') || combined.includes('catch') || combined.includes('исключен'))
+    && /\btry\s*\{/.test(lineText)
+  ) {
+    return true;
+  }
+
+  if (
+    (combined.includes('fallback') || combined.includes('||'))
+    && /\|\|\s*[{'"]/.test(lineText)
+  ) {
+    return true;
+  }
+
+  if (
+    (combined.includes('слэш') || combined.includes('slash') || combined.includes('url') || combined.includes('URL'))
+    && /\$\{[^}]+\}\$\{/.test(lineText)
+  ) {
+    return true;
+  }
+
+  return false;
+};
+
+/** Suggestion asks to add slash but current line already concatenates without extra slash. */
+export const isIntentionalUrlSlashChangeInDiff = (
+  lineText: string,
+  message: string,
+  suggestion: string | undefined,
+  diff: string | undefined,
+): boolean => {
+  if (!diff) {
+    return false;
+  }
+  const combined = `${message} ${suggestion ?? ''}`.toLowerCase();
+  if (!combined.includes('слэш') && !combined.includes('slash') && !combined.includes('url')) {
+    return false;
+  }
+  const wantsSlash = /добавьте\s+слэш|add\s+slash|\/\s*в\s+начало/i.test(combined);
+  const wantsNoSlash = /уберите\s+слэш|лишн.*слэш|without\s+slash/i.test(combined);
+  const lineHasJoin = /\$\{[^}]+\}\$\{/.test(lineText) && !/\$\{[^}]+\}\/\$\{/.test(lineText);
+  const lineHasSlashJoin = /\$\{[^}]+\}\/\$\{/.test(lineText);
+
+  const parsed = parseDiffLines(diff);
+  const removedHadSlash = parsed.removedLineTexts.some((t) => /\$\{[^}]+\}\/\$\{/.test(t));
+  const addedWithoutSlash = parsed.addedLineTexts.some((t) => /\$\{[^}]+\}\$\{/.test(t) && !/\$\{[^}]+\}\/\$\{/.test(t));
+
+  if (wantsSlash && lineHasJoin && (removedHadSlash || addedWithoutSlash)) {
+    return true;
+  }
+  if (wantsNoSlash && lineHasSlashJoin) {
+    return true;
+  }
   return false;
 };

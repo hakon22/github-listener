@@ -32,6 +32,11 @@ const GENERIC_LINE_PATTERNS: RegExp[] = [
   /^\s*for\s*\(\s*const\s+/,
   /^\s*this\.loading\s*=/,
   /^\s*\}\s*;?\s*$/,
+  /^\s*delete\s+/,
+  /^\s*@OneToMany/,
+  /^\s*@ManyToOne/,
+  /^\s*@OneToOne/,
+  /`[^`]*`/,
 ];
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -101,7 +106,27 @@ export const isLineCoherentWithMessage = (
   }
 
   if (blamed.size > 0) {
+    const numericBlamed = [...blamed].filter((name) => /^\d+$/.test(name));
+    if (numericBlamed.length > 0 && /\{\s*id\s*:\s*\d+/.test(lineText)) {
+      return false;
+    }
     return [...blamed].every((name) => new RegExp(`\\b${escapeRegex(name)}\\b`).test(lineText));
+  }
+
+  const propertyPathsInMessage = [...message.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+)\b/g)]
+    .map((match) => match[1])
+    .filter((pathValue) => pathValue.includes('.'));
+
+  for (const propertyPath of propertyPathsInMessage) {
+    const segments = propertyPath.split('.');
+    const lastSegment = segments[segments.length - 1];
+    if (!new RegExp(`\\.\\s*${escapeRegex(lastSegment)}\\b`).test(lineText)
+      && !new RegExp(`\\b${escapeRegex(lastSegment)}\\b`).test(lineText)) {
+      return false;
+    }
+    if (/=\s*\w+\s*;?\s*$/.test(lineText.trim()) && !lineText.includes('.')) {
+      return false;
+    }
   }
 
   const tokens = extractMessageTokens(message, suggestion);

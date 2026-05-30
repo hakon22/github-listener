@@ -1,7 +1,8 @@
 import * as path from 'path';
 import { VectorStoreService } from '@/services/analysis/vector-store.service';
 import { ModelBaseService } from '@/services/core/model-base.service';
-import { buildIssueFilterContext, filterCodeIssues } from '@/services/analysis/issue-filter.service';
+import { buildIssueFilterContext, buildCodeSnippetForIssue, filterCodeIssues, type IssueFilterContext } from '@/services/analysis/issue-filter.service';
+import { deduplicateIssues } from '@/services/analysis/false-positive-filters';
 import type { CodeIssueInterface } from '@/services/analysis/code-analyzer.service';
 import type { ScmChangeInterface } from '@/interfaces/scm-change.interface';
 
@@ -34,15 +35,23 @@ export interface AICodeIssueRecommendation extends CodeIssueInterface {
   impact?: string;
   /** Пример исправленного кода (если применимо) */
   codeExample?: string;
+  /** Подстрока с line, подтверждённая skeptic-проходом */
+  evidenceQuote?: string;
 }
 
 interface AIPartialRecommendation {
   _idx?: number;
+  confirmed?: boolean;
+  evidenceQuote?: string;
   type?: AICodeIssueRecommendation['type'];
   message?: string;
   suggestion?: string;
   impact?: string;
   codeExample?: string;
+}
+
+export interface GetRecommendationsOptions {
+  filterContext?: IssueFilterContext;
 }
 
 interface PushCommitSummaryInput {
@@ -151,10 +160,13 @@ export class AIService extends ModelBaseService {
   /** Минимальный интервал между запросами к модели (не более 1 запроса в секунду). */
   private static readonly MIN_REQUEST_INTERVAL_MS = 1000;
 
-  /** Максимум символов контекста для единого AI-анализа изменений. */
+  /** Максимум символов контекста для единого AI-анализа изменений (на один батч). */
   private static readonly UNIFIED_ANALYSIS_MAX_CHARS = 400000;
 
-  /** Максимум issue, для которых выполняется векторный поиск похожего кода в getRecommendations. */
+  /** Максимум символов diff на файл в unified-анализе. */
+  private static readonly UNIFIED_DIFF_MAX_CHARS_PER_FILE = 12000;
+
+  /** Максимум issue, для которых выполняется векторный поиск похожего кода в skeptic-проходе. */
   private static readonly MAX_ISSUES_FOR_VECTOR_SEARCH = 15;
 
   /** Строка содержит обращение к свойству (obj.prop или obj?.prop). */
@@ -166,71 +178,37 @@ export class AIService extends ModelBaseService {
     super();
 
     this.codeReviewPrompt = PromptTemplate.fromTemplate(`
-      Ты — опытный ревьюер TypeScript/Node.js кода.
-      
-      Тебе переданы только критические кандидаты (error/security): проблемы статического анализа и логические кандидаты на ошибки в рантайме.
-      - список проблем (file, line, message, rule, suggestion, _idx);
-      - похожие по смыслу фрагменты кода из проекта.
-      
-      Проблемы (JSON-массив):
+      Ты — skeptic-ревьюер TypeScript/Node.js. По умолчанию ОТКЛОНЯЙ каждый кандидат.
+
+      Кандидаты (JSON): file, line, message, rule, snippet (код вокруг line), _idx.
       {issues}
-      
-      Похожие фрагменты кода (JSON-массив, каждый элемент: "file", "score", "snippet"):
+
+      Похожие фрагменты из проекта (массив массивов, индекс = _idx кандидата; элементы: file, score, snippet):
       {projectPatterns}
-      
-      ВАЖНО: Возвращай рекомендации только для тех проблем, которые гарантированно приведут к ошибке в рантайме, падению или уязвимости. Не включай quality, best_practice, стилистику — только type "security" или проблемы с реальным риском падения/некорректных данных.
-      
-      ОСОБЫЕ ПРАВИЛА ДЛЯ ЛОГИЧЕСКИХ ИЗМЕНЕНИЙ:
-      - Если rule === "logical-entity-schema-change":
-        - поле suggestion содержит JSON с деталями изменения схемы сущности:
-          {{
-            "kind": "entity-schema-change",
-            "entityName": string,
-            "file": string,
-            "addedProperties": [{{ "name": string, "type": string, "decorators": string[] }}],
-            "removedProperties": [{{ "name": string, "type": string, "decorators": string[] }}]
-          }}
-        - Твоя задача — логически проверить по коду проблемы и похожим фрагментам, не создает ли это риск:
-          - где-то создаётся сущность без новых полей;
-          - где-то формируется или читается объект, не учитывающий новые поля.
-        - Если риск существенный (может привести к падению, неконсистентным данным, ошибкам миграций) — сформулируй проблему и рекомендацию с приоритетом.
-      
-      - Если rule === "logical-function-signature-change":
-        - поле suggestion содержит JSON с деталями изменения сигнатуры:
-          {{
-            "kind": "function-signature-change",
-            "functionName": string,
-            "className"?: string,
-            "file": string,
-            "addedParameters": [{{ "name": string, "type": string, "optional": boolean, "hasDefault": boolean }}],
-            "removedParameters": [{{ "name": string, "type": string, "optional": boolean, "hasDefault": boolean }}]
-          }}
-        - Твоя задача — логически проверить по коду проблемы и похожим фрагментам, не остались ли вызовы функции/метода по старой схеме
-          (без новых параметров, с устаревшим порядком аргументов и т.п.).
-        - Если риск существенный (ошибки выполнения, падения, некорректная бизнес-логика) — обязательно выдели это как важную рекомендацию.
-      
-      - Если rule === "logical-query-result-mismatch":
-        - это проблема, найденная логическим анализом ИИ: код обращается к полям/связям результата запроса, которые, по смыслу кода запроса, не загружаются (TypeORM relations/join, Knex select/join, raw SQL, Prisma include/select и т.д.). В рантайме — undefined или ошибка.
-        - Рекомендация: добавить недостающие поля/связи в выборку. Выдели это как критичную ошибку в "impact".
-      
-      Каждая входная проблема содержит поле "_idx" — уникальный порядковый номер. Верни JSON-массив ТОЛЬКО для критических проблем (ошибка в рантайме, падение, security). Для некритических проблем элемент в массив не включай. Каждый элемент ОБЯЗАТЕЛЬНО должен содержать "_idx" — тот же номер, что в исходной проблеме:
+
+      Подтверди (confirmed: true) ТОЛЬКО если на строке line в snippet есть незащищённое выражение, которое гарантированно даст TypeError/падение/security-дыру.
+      - ?., ??, || {{}}, if (!x) return, try/catch, await уже на строке — отклоняй.
+      - message?: в типе, новый enum, delete, SQL-строка, смена сигнатуры без call site на line — отклоняй.
+      - evidenceQuote — точная подстрока из snippet (с line), доказывающая проблему. Не цитируй код только из projectPatterns.
+
+      Для rule logical-query-result-mismatch / logical-entity-usage / logical-function-signature-change: используй projectPatterns для цепочки вызовов, но confirmed только если незащищённый доступ доказан на line в snippet.
+
+      Формат ответа — JSON-массив (только подтверждённые):
       [
         {{
-          "_idx": <число из поля _idx входной проблемы>,
-          "type": "security" или "performance" (только если приведёт к падению/ошибке; не используй quality/best_practice),
-          "message": "Краткое описание проблемы (1 предложение, по-русски, не более 160 символов)",
-          "suggestion": "Краткая рекомендация, как исправить (1 предложение, по-русски, не более 160 символов)",
-          "impact": "К чему приведёт в проде: ошибка в рантайме, падение, уязвимость (1 предложение, по-русски, не более 160 символов)",
-          "codeExample": "Короткий пример исправленного кода, если уместно"
+          "_idx": <из входа>,
+          "confirmed": true,
+          "evidenceQuote": "подстрока с line",
+          "type": "security",
+          "message": "кратко, по-русски, до 160 символов",
+          "suggestion": "как исправить, до 160 символов",
+          "impact": "что будет в проде, до 160 символов",
+          "codeExample": "опционально"
         }}
       ]
-      
-      ТРЕБОВАНИЯ:
-      - Пиши ТОЛЬКО по-русски.
-      - Включай в массив только критические проблемы (ошибка в рантайме, падение, security). Не включай догадки, стилистику, quality, best_practice.
-      - Будь особенно внимателен к rule "logical-entity-schema-change", "logical-function-signature-change", "logical-query-result-mismatch": включай только если есть реальный риск падения или некорректных данных.
-      - Не используй Markdown и текст вне JSON.
-      - Выведи ТОЛЬКО JSON-массив без лишнего текста.
+
+      Если ни один кандидат не подтверждён — верни [].
+      Только JSON, без markdown.
     `);
 
     this.logicalDataLoadingPrompt = PromptTemplate.fromTemplate(`
@@ -353,13 +331,9 @@ export class AIService extends ModelBaseService {
       
       Задача: найди только те проблемы, которые гарантированно приведут к ошибке в рантайме, падению или уязвимости. Не сообщай warning/info, стилистику, догадки.
 
-      DIFF И АКТУАЛЬНЫЙ КОД:
-      - Анализируй в первую очередь строки diff с префиксом + (добавлено) и итоговый newContent.
-      - Строки только с префиксом - (удалено) — это старый код, НЕ сообщай по ним проблемы как о текущем состоянии.
-      - Если на строке уже есть защита (?., ??, || fallback, JSON.stringify, import) — не сообщай.
-      - Object.values(Enum) в TypeScript безопасен. Параметры с = default и param?: не ломают старые вызовы.
-      - @QueryRestActionInjectDecorator / @BodyRestActionInjectDecorator / @ParamsRestActionInjectDecorator — DTO-валидация уже есть; не пиши «нет валидации» на middlewares:/name: metadata.
-      - hasOwnProperty на типизированном config — не critical. eslint/style (let/const, ;) — не security.
+      DIFF: анализируй + и newContent; не сообщай по - строкам. Сомнение — не включай в ответ.
+
+      НЕ СООБЩАЙ (не runtime): новый enum без switch; message?/param?: в типах; delete; SQL/knex.raw строки; @OneToMany без init; optional ?./??; parseInt/parseFloat || 0; смена сигнатуры без сломанного вызова на line; race/XSS без доказательства на line.
 
       ОБЯЗАТЕЛЬНОЕ ПРАВИЛО УВЕРЕННОСТИ (ORM, «незагруженные» поля, undefined):
       - Про отсутствие relations/include/select и про обращение к неподгруженным связям сообщай ТОЛЬКО если на 100% проследил цепочку от запроса к данным до этой строки и доказал несоответствие. Любое сомнение, другой источник объекта (массив, .map, литерал, параметр извне без показанного find) — не включай проблему.
@@ -442,20 +416,43 @@ export class AIService extends ModelBaseService {
     `);
   }
 
-  public getRecommendations = async (issues: CodeIssueInterface[]): Promise<AICodeIssueRecommendation[]> => {
+  private isEvidenceQuoteOnLine = (
+    evidenceQuote: string | undefined,
+    fileContent: string | undefined,
+    lineOneBased: number,
+  ): boolean => {
+    if (!evidenceQuote?.trim() || !fileContent) {
+      return false;
+    }
+    const lineText = fileContent.split('\n')[lineOneBased - 1] ?? '';
+    const normalizedQuote = evidenceQuote.trim();
+    return lineText.includes(normalizedQuote) || buildCodeSnippetForIssue(fileContent, lineOneBased).includes(normalizedQuote);
+  };
+
+  public getRecommendations = async (
+    issues: CodeIssueInterface[],
+    options?: GetRecommendationsOptions,
+  ): Promise<AICodeIssueRecommendation[]> => {
     if (!issues.length) {
       return [];
     }
 
-    const llm = await this.getLlm();
+    const filterContext = options?.filterContext;
+    const contentByFile = filterContext?.contentByFile ?? new Map<string, string>();
 
-    const chain = RunnableSequence.from([
-      this.codeReviewPrompt,
-      llm,
-      new StringOutputParser(),
-    ]);
+    const issuesWithContext = issues.map((issue, index) => {
+      const normalizedFile = path.normalize(issue.file).replace(/\\/g, '/');
+      const fileContent = contentByFile.get(normalizedFile) ?? '';
+      const snippet = fileContent
+        ? buildCodeSnippetForIssue(fileContent, issue.line)
+        : '';
+      return {
+        ...issue,
+        _idx: index,
+        snippet,
+      };
+    });
 
-    // Векторный поиск только для ограниченного числа issue, чтобы не перегружать пайплайн.
     const projectPatterns: { file: string; score: number; snippet: string; }[][] = [];
     const issuesToEnrich = Math.min(issues.length, AIService.MAX_ISSUES_FOR_VECTOR_SEARCH);
 
@@ -465,29 +462,33 @@ export class AIService extends ModelBaseService {
       }
 
       const issue = issues[issueIndex];
-
       const similarCodeList = await this.vectorStoreService.findSimilarCode(
         `${issue.file}:${issue.line} ${issue.message}`,
         3,
       );
 
-      const mappedSimilarCodeList = similarCodeList.map((similarCodeEntry) => ({
-        file: similarCodeEntry.file,
-        score: similarCodeEntry.score,
-        snippet: similarCodeEntry.content.slice(0, 800),
-      }));
-
-      projectPatterns.push(mappedSimilarCodeList);
+      projectPatterns.push(
+        similarCodeList.map((entry) => ({
+          file: entry.file,
+          score: entry.score,
+          snippet: entry.content.slice(0, 800),
+        })),
+      );
     }
 
     for (let index = issuesToEnrich; index < issues.length; index += 1) {
       projectPatterns.push([]);
     }
 
-    const issuesWithIdx = issues.map((issue, index) => ({ ...issue, _idx: index }));
+    const llm = await this.getLlm();
+    const chain = RunnableSequence.from([
+      this.codeReviewPrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
 
     const result = await chain.invoke({
-      issues: JSON.stringify(issuesWithIdx),
+      issues: JSON.stringify(issuesWithContext),
       projectPatterns: JSON.stringify(projectPatterns),
     });
 
@@ -506,14 +507,12 @@ export class AIService extends ModelBaseService {
         partials = parsed as AIPartialRecommendation[];
       }
     } catch {
-      // Если модель вернула невалидный JSON, просто вернём "плоские" рекомендации без обогащения,
-      // чтобы не ронять весь пайплайн.
       partials = [];
     }
 
     const partialsByIdx = new Map<number, AIPartialRecommendation>();
     for (const partial of partials) {
-      if (typeof partial._idx === 'number') {
+      if (typeof partial._idx === 'number' && partial.confirmed === true) {
         partialsByIdx.set(partial._idx, partial);
       }
     }
@@ -522,36 +521,30 @@ export class AIService extends ModelBaseService {
 
     for (let index = 0; index < issues.length; index += 1) {
       const issue = issues[index];
-      const ai = partialsByIdx.get(index) ?? {};
-
-      // Для logical-function-signature-change нам не нужен «общий» кандидат
-      // вида «Изменилась сигнатура, проверьте все места».
-      // Если модель не вернула конкретную рекомендацию (message/impact/suggestion),
-      // просто пропускаем эту проблему, чтобы в Telegram попали только реальные риски.
-      if (
-        issue.rule === 'logical-function-signature-change'
-        && !ai.message
-        && !ai.impact
-        && !ai.suggestion
-        && !ai.codeExample
-      ) {
-        // Модель не нашла конкретных проблем по этой смене сигнатуры.
-        // Считаем это допустимым изменением и не показываем базовый кандидат.
-        // Переходим к следующей проблеме без добавления рекомендации.
-        this.loggerService.warn(`Logical function signature change without specific recommendation: ${JSON.stringify(issue)}`);
-      } else {
-        recommendations.push({
-          ...issue,
-          type: ai.type ?? 'quality',
-          // message: prefer AI text but fall back to original
-          message: ai.message ?? issue.message,
-          // keep original ESLint severity, but suggestion may be refined
-          severity: issue.severity,
-          suggestion: ai.suggestion ?? issue.suggestion,
-          impact: ai.impact,
-          codeExample: ai.codeExample,
-        });
+      const ai = partialsByIdx.get(index);
+      if (!ai) {
+        continue;
       }
+
+      const normalizedFile = path.normalize(issue.file).replace(/\\/g, '/');
+      const fileContent = contentByFile.get(normalizedFile);
+      if (!this.isEvidenceQuoteOnLine(ai.evidenceQuote, fileContent, issue.line)) {
+        this.loggerService.warn(
+          `Skeptic review dropped issue without valid evidenceQuote: ${issue.file}:${issue.line}`,
+        );
+        continue;
+      }
+
+      recommendations.push({
+        ...issue,
+        type: ai.type === 'security' || ai.type === 'performance' ? ai.type : 'security',
+        message: ai.message ?? issue.message,
+        severity: issue.severity,
+        suggestion: ai.suggestion ?? issue.suggestion,
+        impact: ai.impact,
+        codeExample: ai.codeExample,
+        evidenceQuote: ai.evidenceQuote,
+      });
     }
 
     return recommendations;
@@ -559,72 +552,79 @@ export class AIService extends ModelBaseService {
 
   /**
    * Единый AI-анализ изменений: один запрос к модели с контекстом изменённых файлов.
-   * Возвращает список проблем (безопасность, производительность, загрузка данных, контракты).
-   * Включать через USE_UNIFIED_AI_ANALYSIS=true как альтернативу getLogicalDataLoadingIssues.
+   * Возвращает список проблем (безопасность, загрузка данных, контракты).
    */
-  public getUnifiedAnalysisIssues = async (
+  private buildUnifiedChangeEntry = (
+    change: ScmChangeInterface,
+    maxContentChars: number,
+  ): { file: string; newContent: string; diff: string; charSize: number; } | null => {
+    const originalContent = change.newContent ?? '';
+    if (!originalContent.trim()) {
+      return null;
+    }
+    const newContent = this.buildNumberedContent(originalContent, maxContentChars);
+    const diffBudget = Math.max(
+      0,
+      Math.min(AIService.UNIFIED_DIFF_MAX_CHARS_PER_FILE, maxContentChars - newContent.length),
+    );
+    const diff = (change.diff ?? '').slice(0, diffBudget);
+    const charSize = newContent.length + diff.length;
+    if (charSize === 0) {
+      return null;
+    }
+    return {
+      file: change.file,
+      newContent,
+      diff,
+      charSize,
+    };
+  };
+
+  private buildUnifiedAnalysisBatches = (
     changes: ScmChangeInterface[],
-    changedPaths?: Set<string>,
-  ): Promise<CodeIssueInterface[]> => {
-    if (!changes.length) {
-      return [];
-    }
+  ): Array<Array<{ file: string; newContent: string; diff: string; }>> => {
+    const batches: Array<Array<{ file: string; newContent: string; diff: string; }>> = [];
+    let currentBatch: Array<{ file: string; newContent: string; diff: string; }> = [];
+    let batchChars = 0;
 
-    let totalChars = 0;
-    const payload: Array<{ file: string; newContent: string; diff: string }> = [];
-    const maxPerFile = Math.floor(AIService.UNIFIED_ANALYSIS_MAX_CHARS / Math.max(changes.length, 1));
-
-    for (const change of changes) {
-      if (totalChars >= AIService.UNIFIED_ANALYSIS_MAX_CHARS) {
-        break;
-      }
-      const originalContent = change.newContent ?? '';
-      if (!originalContent.trim()) {
-        continue;
-      }
-      const newContent = this.buildNumberedContent(originalContent, maxPerFile);
-      const diffMaxLen = Math.max(0, maxPerFile - newContent.length);
-      const diff = (change.diff ?? '').slice(0, Math.min(2000, diffMaxLen));
-      const slice = newContent.length + diff.length;
-      if (slice === 0) {
-        continue;
-      }
-      totalChars += slice;
-      payload.push({
-        file: change.file,
-        newContent,
-        diff,
-      });
-    }
-
-    if (!payload.length) {
-      return [];
-    }
-
-    const contentByFileForUnified = new Map<string, string>();
-    for (const change of changes) {
-      if (change.newContent?.trim()) {
-        contentByFileForUnified.set(path.normalize(change.file).replace(/\\/g, '/'), change.newContent);
-      }
-    }
-
-    const llm = await this.getLlm();
-    const chain = RunnableSequence.from([
-      this.unifiedAnalysisPrompt,
-      llm,
-      new StringOutputParser(),
-    ]);
-
-    const result = await chain.invoke({
-      changes: JSON.stringify(payload),
-    });
-
-    this.loggerService.debug(
-      this.TAG,
-      'AI unifiedAnalysisPrompt raw response',
-      typeof result === 'string' ? result.slice(0, 2000) : result,
+    const maxPerFile = Math.floor(
+      AIService.UNIFIED_ANALYSIS_MAX_CHARS / Math.max(Math.min(changes.length, 20), 1),
     );
 
+    for (const change of changes) {
+      const entry = this.buildUnifiedChangeEntry(change, maxPerFile);
+      if (!entry) {
+        continue;
+      }
+
+      if (
+        batchChars + entry.charSize > AIService.UNIFIED_ANALYSIS_MAX_CHARS
+        && currentBatch.length > 0
+      ) {
+        batches.push(currentBatch);
+        currentBatch = [];
+        batchChars = 0;
+      }
+
+      currentBatch.push({
+        file: entry.file,
+        newContent: entry.newContent,
+        diff: entry.diff,
+      });
+      batchChars += entry.charSize;
+    }
+
+    if (currentBatch.length > 0) {
+      batches.push(currentBatch);
+    }
+
+    return batches;
+  };
+
+  private parseUnifiedAnalysisResponse = (
+    result: string,
+    contentByFileForUnified: Map<string, string>,
+  ): CodeIssueInterface[] => {
     try {
       const jsonText = this.extractJsonPayload(result);
       const parsed = JSON.parse(jsonText) as unknown;
@@ -633,7 +633,7 @@ export class AIService extends ModelBaseService {
       }
       const mapped = parsed
         .filter(
-          (item): item is { file: string; line: unknown; severity: string; message: string; rule?: string; suggestion?: string } =>
+          (item): item is { file: string; line: unknown; severity: string; message: string; rule?: string; suggestion?: string; } =>
             typeof item === 'object' &&
             item !== null &&
             'file' in item &&
@@ -650,19 +650,63 @@ export class AIService extends ModelBaseService {
           suggestion: typeof item.suggestion === 'string' ? item.suggestion : undefined,
         }));
 
-      const filteredMapped = mapped.filter((issue) =>
-        !this.isGuardedDataLoadingIssue(issue, contentByFileForUnified),
-      );
-
-      const afterLegacyFilters = filteredMapped
+      return mapped
+        .filter((issue) => !this.isGuardedDataLoadingIssue(issue, contentByFileForUnified))
         .filter((issue) => issue.severity === 'error')
         .filter((issue) => this.isUnifiedIssueBlameLineCoherentWithMessage(issue, contentByFileForUnified));
-
-      const filterContext = buildIssueFilterContext(changes, changedPaths);
-      return filterCodeIssues(afterLegacyFilters, filterContext);
     } catch {
       return [];
     }
+  };
+
+  public getUnifiedAnalysisIssues = async (
+    changes: ScmChangeInterface[],
+    changedPaths?: Set<string>,
+  ): Promise<CodeIssueInterface[]> => {
+    if (!changes.length) {
+      return [];
+    }
+
+    const contentByFileForUnified = new Map<string, string>();
+    for (const change of changes) {
+      if (change.newContent?.trim()) {
+        contentByFileForUnified.set(path.normalize(change.file).replace(/\\/g, '/'), change.newContent);
+      }
+    }
+
+    const batches = this.buildUnifiedAnalysisBatches(changes);
+    if (!batches.length) {
+      return [];
+    }
+
+    const llm = await this.getLlm();
+    const chain = RunnableSequence.from([
+      this.unifiedAnalysisPrompt,
+      llm,
+      new StringOutputParser(),
+    ]);
+
+    const allIssues: CodeIssueInterface[] = [];
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      if (batchIndex > 0) {
+        await this.rateLimitDelay();
+      }
+      const payload = batches[batchIndex];
+      const result = await chain.invoke({
+        changes: JSON.stringify(payload),
+      });
+      this.loggerService.debug(
+        this.TAG,
+        'AI unifiedAnalysisPrompt raw response',
+        typeof result === 'string' ? result.slice(0, 2000) : result,
+      );
+      const batchIssues = this.parseUnifiedAnalysisResponse(result, contentByFileForUnified);
+      allIssues.push(...batchIssues);
+    }
+
+    const filterContext = buildIssueFilterContext(changes, changedPaths);
+    return filterCodeIssues(deduplicateIssues(allIssues), filterContext);
   };
 
   /**
