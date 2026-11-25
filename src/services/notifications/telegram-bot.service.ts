@@ -15,7 +15,7 @@ export class TelegramBotService {
   private bot: Telegraf<Context> | null = null;
 
   private readonly proxyAgent: HttpsProxyAgent<any> | null = process.env.PROXY_USER && process.env.PROXY_PASS && process.env.PROXY_HOST
-    ? new HttpsProxyAgent(`http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}`)
+    ? new HttpsProxyAgent(`https://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}`)
     : null;
 
   public getProxyAgent = (): HttpsProxyAgent<any> | null => this.proxyAgent;
